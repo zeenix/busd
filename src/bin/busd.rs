@@ -24,6 +24,10 @@ struct BusdArgs {
     #[clap(short = 'a', long, value_parser)]
     address: Option<String>,
 
+    /// The file descriptor to print the bus address to.
+    #[clap(long, value_parser)]
+    print_address: Option<Option<i32>>,
+
     /// The authentication mechanism to use.
     #[clap(long)]
     #[arg(value_enum, default_value_t = AuthMechanism::External)]
@@ -108,6 +112,17 @@ async fn main() -> Result<()> {
         .unwrap();
 
     let mut bus = bus::Bus::for_address(address, args.auth_mechanism.into()).await?;
+
+    if let Some(fd) = args.print_address {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd.unwrap_or(1)) };
+        // make a single string, busd test code doesn't handle multiple IO!
+        let addr = format!("{},guid={}\n", bus.address().to_string(), bus.guid());
+        write!(file, "{}", addr)?;
+        file.flush()?;
+    }
 
     // FIXME: How to handle this gracefully on Windows?
     #[cfg(unix)]
