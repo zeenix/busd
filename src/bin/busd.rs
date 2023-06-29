@@ -1,9 +1,12 @@
 extern crate busd;
 
-use busd::bus;
+use busd::{
+    bus,
+    config::{self, BusConfig},
+};
 
 use anyhow::Result;
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, ValueEnum};
 #[cfg(unix)]
 use tokio::{select, signal::unix::SignalKind};
 use tracing::error;
@@ -13,7 +16,10 @@ use tracing::{info, warn};
 /// A simple D-Bus broker.
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
-struct Args {
+struct BusdArgs {
+    #[command(flatten)]
+    config: ConfigArg,
+
     /// The address to listen on.
     #[clap(short = 'a', long, value_parser)]
     address: Option<String>,
@@ -22,6 +28,14 @@ struct Args {
     #[clap(long)]
     #[arg(value_enum, default_value_t = AuthMechanism::External)]
     auth_mechanism: AuthMechanism,
+}
+
+#[derive(Args, Debug)]
+#[group(required = false, multiple = false)]
+struct ConfigArg {
+    /// The configuration file.
+    #[clap(long, value_parser)]
+    config_file: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -51,10 +65,29 @@ impl From<AuthMechanism> for zbus::AuthMechanism {
 async fn main() -> Result<()> {
     busd::tracing_subscriber::init();
 
-    let args = Args::parse();
+    let args = BusdArgs::parse();
 
-    let mut bus =
-        bus::Bus::for_address(args.address.as_deref(), args.auth_mechanism.into()).await?;
+    let mut config = BusConfig::default();
+    if let Some(file) = args.config.config_file {
+        config = BusConfig::read(file)?;
+    }
+
+    if let Some(address) = args.address {
+        config.elements.push(config::Element::Listen(address));
+    }
+
+    // FIXME: we don't support multiple <listen> atm
+    let address = config
+        .elements
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            config::Element::Listen(l) => Some(l),
+            _ => None,
+        })
+        .unwrap();
+
+    let mut bus = bus::Bus::for_address(address, args.auth_mechanism.into()).await?;
 
     // FIXME: How to handle this gracefully on Windows?
     #[cfg(unix)]
