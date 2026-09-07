@@ -7,8 +7,8 @@ use zbus::{
         transport::{Tcp, Unix, UnixSocket},
         Transport,
     },
-    connection::{self, socket::BoxedSplit},
-    Address, AuthMechanism, Connection, Guid, OwnedGuid,
+    connection::{self, socket::BoxedSplit, AuthMechanism},
+    Address, Connection, Guid, OwnedGuid,
 };
 
 use crate::{

@@ -7,9 +7,9 @@ pub use monitor::*;
 use anyhow::Result;
 use tracing::trace;
 use zbus::{
-    connection::{self, socket::BoxedSplit},
+    connection::{self, socket::BoxedSplit, AuthMechanism },
     names::{BusName, OwnedUniqueName},
-    AuthMechanism, Connection, MessageStream, OwnedGuid, OwnedMatchRule,
+    Connection, MessageStream, OwnedGuid, OwnedMatchRule,
 };
 
 use crate::{fdo, match_rules::MatchRules, name_registry::NameRegistry};

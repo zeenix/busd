@@ -14,7 +14,7 @@ use zbus::{
     interface, message,
     names::{BusName, InterfaceName, OwnedBusName, OwnedUniqueName, UniqueName, WellKnownName},
     object_server::{ResponseDispatchNotifier, SignalEmitter},
-    zvariant::Optional,
+    Optional,
     OwnedGuid, OwnedMatchRule,
 };
 
