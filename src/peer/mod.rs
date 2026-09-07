@@ -4,10 +4,10 @@ pub use stream::*;
 mod monitor;
 pub use monitor::*;
 
+use crate::trace;
 use anyhow::Result;
-use tracing::trace;
 use zbus::{
-    connection::{self, socket::BoxedSplit, AuthMechanism },
+    connection::{self, socket::BoxedSplit, AuthMechanism},
     names::{BusName, OwnedUniqueName},
     Connection, MessageStream, OwnedGuid, OwnedMatchRule,
 };
