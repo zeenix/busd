@@ -53,5 +53,5 @@ argument parsing via clap). Key modules:
 - **`tracing_subscriber.rs`** — logging setup (behind the default `tracing-subscriber`
   feature).
 
-busd tracks zbus's git `main` (see the note in `Cargo.toml`), so bus-side changes there
+busd builds on zbus releases from crates.io, so bus-side changes in a new zbus release
 can require updating this crate.
