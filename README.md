@@ -12,6 +12,24 @@ than other D-Bus brokers.
 
 Alpha. It's not ready for production use yet. Only the essentials are in place.
 
+## Performance
+
+busd keeps up with [dbus-broker], the broker that most systems run, where the bus is busy, and is
+well ahead of [dbus-daemon]. Measured with [dbus-bench] on a laptop with an AMD Ryzen 7 7840U,
+running Fedora 44, as the median of 15 runs:
+
+| Broker             | 1 client | 20 clients | CPU time with 20 clients | Peak memory |
+|--------------------|---------:|-----------:|-------------------------:|------------:|
+| busd               |  0.088 s |    0.926 s |                   0.42 s |     6.3 MiB |
+| dbus-broker 37     |  0.082 s |    0.930 s |                   0.41 s |     7.9 MiB |
+| dbus-daemon 1.16.2 |  0.160 s |    1.185 s |                   1.14 s |     6.0 MiB |
+
+Each client makes 1000 method calls with 16 KiB of data each, and the 20 clients make theirs all
+at once. With 20 clients, the benchmark's client keeps its own CPU busy with busd and dbus-broker
+alike, so the CPU time that the broker needs is what tells those two apart. The memory of
+dbus-broker is that of its two processes, its launcher and the broker proper, together. The
+[results] in dbus-bench have the details, and how busd fares on other machines.
+
 ## Installation & Use
 
 Currently, we can only offer installation from source:
@@ -61,3 +79,7 @@ addition of [peer credentials] on every message, which can avoid round-trips on 
 
 [specification]: https://dbus.freedesktop.org/doc/dbus-specification.html
 [peer credentials]: https://github.com/z-galaxy/busd/issues/29
+[dbus-broker]: https://github.com/bus1/dbus-broker
+[dbus-daemon]: https://gitlab.freedesktop.org/dbus/dbus
+[dbus-bench]: https://github.com/zeenix/dbus-bench
+[results]: https://github.com/zeenix/dbus-bench/tree/main/results
