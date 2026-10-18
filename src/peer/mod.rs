@@ -1,6 +1,6 @@
 mod stream;
-use event_listener::{Event, EventListener};
 pub use stream::*;
+use zruntime::{Event, EventListener};
 mod monitor;
 pub use monitor::*;
 

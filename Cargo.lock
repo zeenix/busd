@@ -126,7 +126,6 @@ dependencies = [
  "anyhow",
  "clap",
  "console-subscriber",
- "event-listener",
  "fastrand",
  "futures-util",
  "ntest",
@@ -139,6 +138,7 @@ dependencies = [
  "tracing-subscriber",
  "xdg-home",
  "zbus",
+ "zruntime",
 ]
 
 [[package]]
@@ -307,16 +307,6 @@ checksum = "976dd42dc7e85965fe702eb8164f21f450704bdde31faefd6471dba214cb594e"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "event-listener"
-version = "5.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
-dependencies = [
- "parking",
- "pin-project-lite",
 ]
 
 [[package]]
@@ -799,12 +789,6 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
 ]
-
-[[package]]
-name = "parking"
-version = "2.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
 name = "percent-encoding"

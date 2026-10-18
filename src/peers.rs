@@ -1,6 +1,5 @@
 use crate::{debug, trace, warn};
 use anyhow::{bail, Context, Result};
-use event_listener::EventListener;
 use futures_util::{
     future::{select, Either},
     stream::StreamExt,
@@ -17,6 +16,7 @@ use zbus::{
     names::{BusName, OwnedUniqueName, UniqueName},
     Message, Optional, OwnedGuid,
 };
+use zruntime::EventListener;
 
 use crate::{
     fdo,
