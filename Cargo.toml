@@ -46,7 +46,6 @@ anyhow = "1.0.82"
 # Explicitly depend on serde to enable `rc` feature.
 serde = { version = "1.0.200", features = ["rc"] }
 futures-util = { version = "0.3.30", default-features = false }
-console-subscriber = { version = "0.5.0", optional = true }
 xdg-home = "1.1.0"
 zruntime = { version = "0.2.0", default-features = false, features = ["event"] }
 fastrand = "2.2.0"
@@ -58,7 +57,6 @@ rustix = { version = "1.1.2", default-features = false, features = ["process"] }
 default = ["tracing-subscriber"]
 tracing = ["dep:tracing", "zbus/tracing", "tokio/tracing"]
 tracing-subscriber = ["tracing", "dep:tracing-subscriber"]
-console-subscriber = ["tracing", "dep:console-subscriber"]
 
 [dev-dependencies]
 # The tests drive the bus through proxies, which the binary itself does not need.
