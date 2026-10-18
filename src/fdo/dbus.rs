@@ -4,7 +4,6 @@ use std::{
 };
 
 use crate::warn;
-use tokio::spawn;
 use zbus::{
     fdo::{
         ConnectionCredentials, Error, ReleaseNameReply, RequestNameFlags, RequestNameReply, Result,
@@ -15,6 +14,7 @@ use zbus::{
     object_server::{ResponseDispatchNotifier, SignalEmitter},
     Optional, OwnedGuid, OwnedMatchRule,
 };
+use zruntime::spawn;
 
 use super::msg_sender;
 use crate::{peer::Peer, peers::Peers};
@@ -100,7 +100,8 @@ impl DBus {
             if let Err(e) = Self::name_acquired(&ctxt, owner.into()).await {
                 warn!("Failed to send `NameAcquired` signal: {}", e);
             }
-        });
+        })
+        .detach();
 
         Ok(response)
     }

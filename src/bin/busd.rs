@@ -1,12 +1,19 @@
 extern crate busd;
 
-use std::{fs::File, io::Write, os::fd::FromRawFd, path::PathBuf};
+use std::{
+    fs::File,
+    io::{Read, Write},
+    os::{fd::FromRawFd, unix::net::UnixStream},
+    path::PathBuf,
+    pin::pin,
+};
 
 use busd::{bus, config::Config, error, info, warn};
 
 use anyhow::Result;
 use clap::Parser;
-use tokio::{select, signal::unix::SignalKind};
+use futures_util::future::{select, Either};
+use zruntime::{AsyncIo, SharedRuntime};
 
 /// A simple D-Bus broker.
 #[derive(Parser, Debug)]
@@ -46,8 +53,11 @@ struct Args {
     system: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    zruntime::block_on(run())
+}
+
+async fn run() -> Result<()> {
     busd::tracing_subscriber::init();
 
     let args = Args::parse();
@@ -81,15 +91,20 @@ async fn main() -> Result<()> {
         println!("{}", bus.address());
     }
 
-    let mut sig_int = tokio::signal::unix::signal(SignalKind::interrupt())?;
+    // The signal handler writes a byte to one end of a socket pair, which the runtime can wait for
+    // on the other end.
+    let (sig_int_read, sig_int_write) = UnixStream::pair()?;
+    signal_hook::low_level::pipe::register(signal_hook::consts::SIGINT, sig_int_write)?;
+    let sig_int = AsyncIo::new(&SharedRuntime::current()?, sig_int_read)?;
 
-    select! {
-        _ = sig_int.recv() => {
-            info!("Received SIGINT, shutting down..");
-        }
-        res = bus.run() => match res {
-            Ok(()) => warn!("Bus stopped, shutting down.."),
-            Err(e) => error!("Bus stopped with an error: {}", e),
+    {
+        let interrupted = pin!(sig_int.read_with(|mut stream| stream.read(&mut [0; 1])));
+        let running = pin!(bus.run());
+        match select(interrupted, running).await {
+            Either::Left((Ok(_), _)) => info!("Received SIGINT, shutting down.."),
+            Either::Left((Err(e), _)) => error!("Failed to wait for SIGINT: {}", e),
+            Either::Right((Ok(()), _)) => warn!("Bus stopped, shutting down.."),
+            Either::Right((Err(e), _)) => error!("Bus stopped with an error: {}", e),
         }
     }
 
