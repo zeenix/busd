@@ -16,7 +16,13 @@ library, which it builds on (via zbus's `bus-impl` feature). Being pure Rust, it
 cross-builds far more easily than the reference C broker. Status is alpha: only the
 essentials of the D-Bus specification are in place.
 
+busd runs on [zruntime], the runtime that zbus brings along with its `default-rt`
+feature: the binary drives the bus and all of its connections on the main thread, through
+`zruntime::block_on`. Dropping a zruntime `Task` cancels it, so a fire-and-forget task
+must call `.detach()`.
+
 [zbus]: https://github.com/z-galaxy/zbus
+[zruntime]: https://github.com/z-galaxy/zruntime
 
 ## Development Commands
 

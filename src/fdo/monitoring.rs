@@ -1,13 +1,13 @@
 use std::sync::{Arc, Weak};
 
 use crate::{debug, warn};
-use tokio::spawn;
 use zbus::{
     fdo::{Error, Result},
     interface, message,
     object_server::{ResponseDispatchNotifier, SignalEmitter},
     Optional,
 };
+use zruntime::spawn;
 
 use super::msg_sender;
 use crate::{fdo::DBus, match_rules::MatchRules, peers::Peers};
@@ -96,7 +96,8 @@ impl Monitoring {
             if let Err(e) = DBus::name_lost(&ctxt, owner.into()).await {
                 warn!("Failed to send `NameLost` signal: {}", e);
             }
-        });
+        })
+        .detach();
 
         Ok(response)
     }

@@ -1,6 +1,5 @@
 use crate::{debug, trace, warn};
 use anyhow::{bail, Context, Result};
-use event_listener::EventListener;
 use futures_util::{
     future::{select, Either},
     stream::StreamExt,
@@ -10,13 +9,13 @@ use std::{
     ops::{Deref, DerefMut},
     sync::Arc,
 };
-use tokio::{spawn, sync::RwLock};
 use zbus::{
     connection::{self, AuthMechanism},
     message,
     names::{BusName, OwnedUniqueName, UniqueName},
     Message, Optional, OwnedGuid,
 };
+use zruntime::{lock::RwLock, spawn, EventListener};
 
 use crate::{
     fdo,
@@ -64,10 +63,11 @@ impl Peers {
                 peer.unique_name()
             ),
             None => {
-                tokio::spawn(
+                spawn(
                     self.clone()
                         .serve_peer(peer_stream, listener, unique_name.clone()),
-                );
+                )
+                .detach();
                 peers.insert(unique_name.clone(), peer);
             }
         }
@@ -87,10 +87,11 @@ impl Peers {
                 peer.unique_name()
             ),
             None => {
-                tokio::spawn(
+                spawn(
                     self.clone()
                         .serve_peer(peer_stream, listener, unique_name.clone()),
-                );
+                )
+                .detach();
                 peers.insert(unique_name.clone(), peer);
             }
         }
@@ -141,7 +142,8 @@ impl Peers {
             monitor_monitoring_fut.await;
             peers.monitors.write().await.remove(&unique_name);
             debug!("Monitor {} disconnected", unique_name);
-        });
+        })
+        .detach();
 
         true
     }

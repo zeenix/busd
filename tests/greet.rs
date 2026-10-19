@@ -1,14 +1,17 @@
-use std::{env::temp_dir, time::Duration};
+use std::{env::temp_dir, pin::pin, time::Duration};
 
 use anyhow::anyhow;
 use busd::bus::Bus;
-use futures_util::{pin_mut, stream::StreamExt};
+use futures_util::{
+    future::{select, Either},
+    pin_mut,
+    stream::StreamExt,
+};
 use ntest::timeout;
 use rand::{
     distr::{Alphanumeric, SampleString},
     rng,
 };
-use tokio::{select, sync::mpsc::channel, time::timeout};
 use tracing::instrument;
 use zbus::{
     connection,
@@ -19,34 +22,39 @@ use zbus::{
     proxy::CacheProperties,
     AsyncDrop, Connection, MatchRule, MessageStream, ObjectPath,
 };
+use zruntime::{Event, SharedRuntime};
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test]
 #[instrument]
 #[timeout(30000)]
-async fn greet() {
+fn greet() {
     busd::tracing_subscriber::init();
 
-    // Unix socket
-    let s = Alphanumeric.sample_string(&mut rng(), 10);
-    let path = temp_dir().join(s);
-    let address = format!("unix:path={}", path.display());
-    greet_(&address).await;
+    zruntime::block_on(async {
+        // Unix socket
+        let s = Alphanumeric.sample_string(&mut rng(), 10);
+        let path = temp_dir().join(s);
+        let address = format!("unix:path={}", path.display());
+        greet_(&address).await;
 
-    // TCP socket
-    let address = "tcp:host=127.0.0.1,port=4248".to_string();
-    greet_(&address).await;
+        // TCP socket
+        let address = "tcp:host=127.0.0.1,port=4248".to_string();
+        greet_(&address).await;
+    });
 }
 
 async fn greet_(socket_addr: &str) {
     let mut bus = Bus::for_address(Some(socket_addr)).await.unwrap();
-    let (tx, mut rx) = channel(1);
+    let stop = Event::new();
+    let stopped = stop.listen();
 
-    let handle = tokio::spawn(async move {
-        select! {
-            _ = rx.recv() => (),
-            res = bus.run() => match res {
-                Ok(()) => panic!("Bus exited unexpectedly"),
-                Err(e) => panic!("Bus exited with an error: {e}"),
+    let handle = zruntime::spawn(async move {
+        {
+            let running = pin!(bus.run());
+            match select(stopped, running).await {
+                Either::Left(_) => (),
+                Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
+                Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
             }
         }
 
@@ -57,7 +65,7 @@ async fn greet_(socket_addr: &str) {
         Ok(service_conn) => greet_client(socket_addr).await.map(|_| service_conn),
         Err(e) => Err(e),
     };
-    let _ = tx.send(()).await;
+    stop.notify(usize::MAX);
     let bus = handle.await.unwrap();
     bus.cleanup().await.unwrap();
     let _ = ret.unwrap();
@@ -125,6 +133,7 @@ async fn greet_client(socket_addr: &str) -> anyhow::Result<()> {
         async fn greeted(name: &str, count: u64, path: ObjectPath<'_>);
     }
 
+    let runtime = SharedRuntime::current()?;
     let conn = connection::Builder::address(socket_addr).build().await?;
 
     let proxy = MyGreeterProxy::builder(&conn)
@@ -152,13 +161,15 @@ async fn greet_client(socket_addr: &str) -> anyhow::Result<()> {
     });
     pin_mut!(msg_stream);
     let _ = proxy.say_hello("Maria", false).await?;
-    timeout(Duration::from_millis(10), msg_stream.next())
+    runtime
+        .timeout(Duration::from_millis(10), msg_stream.next())
         .await
         .unwrap_err();
 
     // ..unless it's targeted to us specifically
     let _ = proxy.say_hello("Maria", true).await?;
-    let signal = timeout(Duration::from_millis(10), msg_stream.next())
+    let signal = runtime
+        .timeout(Duration::from_millis(10), msg_stream.next())
         .await?
         .unwrap();
     let args = signal.args()?;

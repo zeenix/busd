@@ -1,5 +1,5 @@
 pub fn init() {
-    #[cfg(all(feature = "tracing-subscriber", not(feature = "console-subscriber")))]
+    #[cfg(feature = "tracing-subscriber")]
     {
         use std::{env, str::FromStr};
 
@@ -31,7 +31,4 @@ pub fn init() {
             .with(targets)
             .init();
     }
-
-    #[cfg(feature = "console-subscriber")]
-    console_subscriber::init();
 }

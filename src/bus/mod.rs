@@ -1,7 +1,6 @@
 use crate::{debug, info, trace, warn};
 use anyhow::{bail, Ok, Result};
 use std::{env, path::Path, str::FromStr, sync::Arc};
-use tokio::{fs::remove_file, spawn};
 use zbus::{
     address::{
         transport::{Tcp, Unix, UnixSocket},
@@ -10,6 +9,7 @@ use zbus::{
     connection::{self, AuthMechanism},
     Address, Connection, Guid, OwnedGuid,
 };
+use zruntime::{fs::remove_file, spawn, Shared, SharedRuntime};
 
 use crate::{
     fdo::{self, DBus, Monitoring},
@@ -17,6 +17,11 @@ use crate::{
 };
 
 /// The bus.
+///
+/// The bus, and every connection it serves, runs on [zruntime]. Create and run it from inside
+/// [`zruntime::block_on`], so that the calling thread runs all of them, on its own runtime.
+///
+/// [zruntime]: https://docs.rs/zruntime
 #[derive(Debug)]
 pub struct Bus {
     inner: Inner,
@@ -36,8 +41,8 @@ pub struct Inner {
 
 #[derive(Debug)]
 enum Listener {
-    Unix(tokio::net::UnixListener),
-    Tcp(tokio::net::TcpListener),
+    Unix(zruntime::net::unix::UnixListener<Shared>),
+    Tcp(zruntime::net::TcpListener<Shared>),
 }
 
 impl Bus {
@@ -173,15 +178,11 @@ impl Bus {
     }
 
     async fn unix_stream(addr: std::os::unix::net::SocketAddr) -> Result<Listener> {
-        // TODO: Use tokio::net::UnixListener directly once it supports abstract sockets:
-        //
-        // https://github.com/tokio-rs/tokio/issues/4610
-
+        let runtime = SharedRuntime::current()?;
         let std_listener =
-            tokio::task::spawn_blocking(move || std::os::unix::net::UnixListener::bind_addr(&addr))
-                .await??;
-        std_listener.set_nonblocking(true)?;
-        tokio::net::UnixListener::from_std(std_listener)
+            zruntime::unblock(move || std::os::unix::net::UnixListener::bind_addr(&addr)).await?;
+
+        zruntime::net::unix::UnixListener::from_std(&runtime, std_listener)
             .map(Listener::Unix)
             .map_err(Into::into)
     }
@@ -191,10 +192,14 @@ impl Bus {
             bail!("`nonce-tcp` transport is not supported (yet).");
         }
         info!("Listening on `{}:{}`.", tcp.host(), tcp.port());
-        let address = (tcp.host(), tcp.port());
+        let runtime = SharedRuntime::current()?;
+        let address = (tcp.host().to_owned(), tcp.port());
 
-        tokio::net::TcpListener::bind(address)
-            .await
+        // zruntime's sockets take socket addresses, not host names. So resolve the host name and
+        // bind on a thread for blocking work, and hand the socket over to the runtime.
+        let std_listener = zruntime::unblock(move || std::net::TcpListener::bind(address)).await?;
+
+        zruntime::net::TcpListener::from_std(&runtime, std_listener)
             .map(Listener::Tcp)
             .map_err(Into::into)
     }
@@ -205,19 +210,17 @@ impl Bus {
         let id = self.next_id();
         let inner = self.inner.clone();
         spawn(async move {
-            let add_peer = async {
-                let builder = socket.into_builder()?;
-
-                inner
-                    .peers
-                    .clone()
-                    .add(&inner.guid, id, builder, inner.auth_mechanism)
-                    .await
-            };
-            if let Err(e) = add_peer.await {
+            let builder = socket.into_builder();
+            let res = inner
+                .peers
+                .clone()
+                .add(&inner.guid, id, builder, inner.auth_mechanism)
+                .await;
+            if let Err(e) = res {
                 warn!("Failed to establish connection: {}", e);
             }
-        });
+        })
+        .detach();
 
         Ok(())
     }
@@ -262,25 +265,20 @@ impl Bus {
 /// A socket accepted by the bus's listener, not yet handed over to zbus.
 #[derive(Debug)]
 enum AcceptedSocket {
-    Unix(tokio::net::UnixStream),
-    Tcp(tokio::net::TcpStream),
+    Unix(zruntime::net::unix::UnixStream<Shared>),
+    Tcp(zruntime::net::TcpStream<Shared>),
 }
 
 impl AcceptedSocket {
     /// Create a builder for a connection over this socket.
     ///
-    /// zbus is given the standard library stream that the Tokio one wraps, and the connection
-    /// then drives it on the runtime it is built on (Tokio, in our case). Taking the stream out of
-    /// Tokio's hands can fail, so call this from the task that sets up the connection, where an
-    /// error costs only this connection, and not from the accept loop, where it would stop the
-    /// bus.
-    fn into_builder(self) -> Result<connection::Builder<'static>> {
-        let builder = match self {
-            AcceptedSocket::Unix(stream) => connection::Builder::unix_stream(stream.into_std()?),
-            AcceptedSocket::Tcp(stream) => connection::Builder::tcp_stream(stream.into_std()?),
-        };
-
-        Ok(builder)
+    /// zbus is given the standard library stream that the zruntime one wraps, and the connection
+    /// then drives it on the runtime it is built on.
+    fn into_builder(self) -> connection::Builder<'static> {
+        match self {
+            AcceptedSocket::Unix(stream) => connection::Builder::unix_stream(stream.into_std()),
+            AcceptedSocket::Tcp(stream) => connection::Builder::tcp_stream(stream.into_std()),
+        }
     }
 }
 

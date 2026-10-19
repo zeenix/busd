@@ -1,43 +1,47 @@
-use std::env::temp_dir;
+use std::{env::temp_dir, pin::pin};
 
 use busd::bus::Bus;
-use futures_util::future::join_all;
+use futures_util::future::{join_all, select, Either};
 use ntest::timeout;
 use rand::{
     distr::{Alphanumeric, SampleString},
     rng,
 };
-use tokio::{select, sync::oneshot::channel};
 use tracing::instrument;
 use zbus::connection;
+use zruntime::Event;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[test]
 #[instrument]
 #[timeout(30000)]
-async fn multi_conenct() {
+fn multi_conenct() {
     busd::tracing_subscriber::init();
 
-    // Unix socket
-    let s = Alphanumeric.sample_string(&mut rng(), 10);
-    let path = temp_dir().join(s);
-    let address = format!("unix:path={}", path.display());
-    multi_conenct_(&address).await;
+    zruntime::block_on(async {
+        // Unix socket
+        let s = Alphanumeric.sample_string(&mut rng(), 10);
+        let path = temp_dir().join(s);
+        let address = format!("unix:path={}", path.display());
+        multi_conenct_(&address).await;
 
-    // TCP socket
-    let address = "tcp:host=127.0.0.1,port=4246".to_string();
-    multi_conenct_(&address).await;
+        // TCP socket
+        let address = "tcp:host=127.0.0.1,port=4246".to_string();
+        multi_conenct_(&address).await;
+    });
 }
 
 async fn multi_conenct_(socket_addr: &str) {
     let mut bus = Bus::for_address(Some(socket_addr)).await.unwrap();
-    let (tx, rx) = channel();
+    let stop = Event::new();
+    let stopped = stop.listen();
 
-    let handle = tokio::spawn(async move {
-        select! {
-            _ = rx => (),
-            res = bus.run() => match res {
-                Ok(()) => panic!("Bus exited unexpectedly"),
-                Err(e) => panic!("Bus exited with an error: {e}"),
+    let handle = zruntime::spawn(async move {
+        {
+            let running = pin!(bus.run());
+            match select(stopped, running).await {
+                Either::Left(_) => (),
+                Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
+                Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
             }
         }
 
@@ -45,7 +49,7 @@ async fn multi_conenct_(socket_addr: &str) {
     });
 
     let ret = multi_clients_connect(socket_addr).await;
-    let _ = tx.send(());
+    stop.notify(usize::MAX);
     let bus = handle.await.unwrap();
     bus.cleanup().await.unwrap();
     ret.unwrap();

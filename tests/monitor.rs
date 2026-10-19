@@ -1,8 +1,12 @@
+use std::pin::pin;
+
 use anyhow::ensure;
 use busd::bus::Bus;
-use futures_util::TryStreamExt;
+use futures_util::{
+    future::{select, Either},
+    TryStreamExt,
+};
 use ntest::timeout;
-use tokio::{select, sync::oneshot::Sender};
 use tracing::instrument;
 use zbus::{
     connection,
@@ -12,37 +16,43 @@ use zbus::{
     proxy::CacheProperties,
     MessageStream,
 };
+use zruntime::Event;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test]
 #[instrument]
 #[timeout(30000)]
-async fn become_monitor() {
+fn become_monitor() {
     busd::tracing_subscriber::init();
 
-    let address = "tcp:host=127.0.0.1,port=4244".to_string();
-    let mut bus = Bus::for_address(Some(&address)).await.unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    zruntime::block_on(async {
+        let address = "tcp:host=127.0.0.1,port=4244".to_string();
+        let mut bus = Bus::for_address(Some(&address)).await.unwrap();
+        let stop = Event::new();
+        let stopped = stop.listen();
 
-    let handle = tokio::spawn(async move {
-        select! {
-            _ = rx => (),
-            res = bus.run() => match res {
-                Ok(()) => panic!("Bus exited unexpectedly"),
-                Err(e) => panic!("Bus exited with an error: {e}"),
+        let handle = zruntime::spawn(async move {
+            {
+                let running = pin!(bus.run());
+                match select(stopped, running).await {
+                    Either::Left(_) => (),
+                    Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
+                    Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
+                }
             }
-        }
 
-        bus
+            bus
+        });
+
+        let ret = become_monitor_client(&address).await;
+        stop.notify(usize::MAX);
+        let bus = handle.await.unwrap();
+        bus.cleanup().await.unwrap();
+        ret.unwrap();
     });
-
-    let ret = become_monitor_client(&address, tx).await;
-    let bus = handle.await.unwrap();
-    bus.cleanup().await.unwrap();
-    ret.unwrap();
 }
 
 #[instrument]
-async fn become_monitor_client(address: &str, tx: Sender<()>) -> anyhow::Result<()> {
+async fn become_monitor_client(address: &str) -> anyhow::Result<()> {
     // Create a monitor that wants all messages.
     let conn = connection::Builder::address(address).build().await?;
     let mut msg_stream = MessageStream::from(&conn);
@@ -144,8 +154,6 @@ async fn become_monitor_client(address: &str, tx: Sender<()>) -> anyhow::Result<
 
         num_received += 1;
     }
-
-    tx.send(()).unwrap();
 
     Ok(())
 }
