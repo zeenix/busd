@@ -1,5 +1,6 @@
 use std::{env::temp_dir, pin::pin};
 
+use anyhow::ensure;
 use busd::bus::Bus;
 use futures_util::{
     future::{select, Either},
@@ -72,16 +73,40 @@ async fn broadcast_signals_(address: &str) -> anyhow::Result<()> {
         .become_monitor(&[signals], 0)
         .await?;
 
+    // A client that wants the signals that are sent to it.
+    let client = connection::Builder::address(address).build().await?;
+    let client_name = client.unique_name().unwrap().to_owned();
+    let rule = MatchRule::builder()
+        .msg_type(message::Type::Signal)
+        .interface("org.zbus.Broadcast")
+        .destination(client_name.as_str())
+        .build()?;
+    let mut received = MessageStream::for_match_rule(rule, &client, None).await?;
+
+    // A broadcast signal, then one that is sent to the client.
     let emitter = connection::Builder::address(address).build().await?;
-    emitter
-        .emit_signal(
-            None::<&str>,
-            "/org/zbus/Broadcast",
-            "org.zbus.Broadcast",
-            "Everyone",
-            &(),
-        )
-        .await?;
+    for (destination, member) in [(None, "Everyone"), (Some(client_name.as_str()), "Client")] {
+        emitter
+            .emit_signal(
+                destination,
+                "/org/zbus/Broadcast",
+                "org.zbus.Broadcast",
+                member,
+                &(),
+            )
+            .await?;
+    }
+
+    // The rule of the client matches both, as with dbus-broker and zbus's own matching.
+    for expected in ["Everyone", "Client"] {
+        let msg = received.try_next().await?.unwrap();
+        let header = msg.header();
+        let member = header.member().unwrap();
+        ensure!(
+            member == expected,
+            "the client got `{member}` rather than `{expected}`"
+        );
+    }
 
     // The monitor gets the broadcast signal, among others.
     loop {
