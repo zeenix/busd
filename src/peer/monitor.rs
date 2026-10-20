@@ -33,7 +33,7 @@ impl Monitor {
     /// Same as [`MatchRules::matches`].
     pub fn interested(&self, msg: &zbus::Message, name_registry: &NameRegistry) -> bool {
         if self.match_rules.is_empty()
-            || msg.header().destination().unwrap() == &BusName::from(&self.unique_name)
+            || msg.header().destination() == Some(&BusName::from(&self.unique_name))
         {
             return true;
         }
