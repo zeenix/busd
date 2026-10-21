@@ -21,7 +21,7 @@ use crate::{
     fdo,
     match_rules::MatchRules,
     name_registry::{NameOwnerChanged, NameRegistry},
-    peer::{Monitor, Peer, Recipient, Stream},
+    peer::{Monitor, Peer, Recipient, Stream, MAX_MESSAGE_FDS},
 };
 
 #[derive(Debug)]
@@ -212,6 +212,15 @@ impl Peers {
                     }
                 }
             };
+            // Passing such a message on would fail, and get its recipients disconnected.
+            if msg.data().fds().len() > MAX_MESSAGE_FDS {
+                warn!(
+                    "Disconnecting `{unique_name}`, as it sent a message with more than \
+                     {MAX_MESSAGE_FDS} file descriptors"
+                );
+
+                break;
+            }
 
             match msg.message_type() {
                 message::Type::Signal => self.broadcast_msg(msg).await,
@@ -227,8 +236,9 @@ impl Peers {
             };
         }
 
-        // Stream is done means the peer disconnected or it became a monitor. Remove it from the
-        // list of peers.
+        // Stream is done means the peer disconnected or it became a monitor, unless the peer sent
+        // a message that gets it disconnected. Remove it from the list of peers: that, and the end
+        // of its stream, close its connection once its queue is written.
         if self.peers_mut().await.remove(&unique_name).is_none() {
             // This means peer was turned into a monitor. `Monitoring` iface will emit the signals.
             return Ok(());

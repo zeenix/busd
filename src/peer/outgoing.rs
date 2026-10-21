@@ -104,6 +104,12 @@ impl Outgoing {
 /// `max_outgoing_bytes`.
 pub const MAX_QUEUED_BYTES: usize = 133_169_152;
 
+/// How many file descriptors a message may carry: as many as Linux passes in one write
+/// (`SCM_MAX_FD`), which is how zbus passes those of a message.
+///
+/// The bus couldn't pass a message with more on, so it disconnects a client that sends one.
+pub const MAX_MESSAGE_FDS: usize = 253;
+
 /// Write the queue to the client's socket, until the client is gone or gets disconnected.
 ///
 /// The client gets disconnected when writing to its socket fails, and when its queue overflows,
