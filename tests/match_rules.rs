@@ -15,7 +15,7 @@ use tracing::instrument;
 use zbus::{
     connection,
     fdo::{DBusProxy, RequestNameFlags},
-    MessageStream,
+    message, MatchRule, MessageStream,
 };
 use zruntime::Event;
 
@@ -71,6 +71,60 @@ async fn signals_to_well_known_names_(address: String) -> anyhow::Result<()> {
         members == ["ToWellKnownName", "ToUniqueName"],
         "the owner got {members:?}"
     );
+
+    Ok(())
+}
+
+/// A signal with a destination goes to no one else, whatever their match rules.
+#[test]
+#[instrument]
+#[timeout(30000)]
+fn signals_to_others() {
+    init_tracing();
+
+    zruntime::block_on(with_bus(signals_to_others_));
+}
+
+async fn signals_to_others_(address: String) -> anyhow::Result<()> {
+    // A client with a match rule that matches every signal of the test.
+    let snooper = connection::Builder::address(address.as_str())
+        .build()
+        .await?;
+    let rule = MatchRule::builder()
+        .msg_type(message::Type::Signal)
+        .interface(INTERFACE)
+        .build()?;
+    let mut snooped = MessageStream::for_match_rule(rule, &snooper, None).await?;
+
+    // And one that owns a name.
+    let owner = connection::Builder::address(address.as_str())
+        .build()
+        .await?;
+    let owner_name = owner.unique_name().unwrap().to_owned();
+    DBusProxy::new(&owner)
+        .await?
+        .request_name(NAME.try_into()?, RequestNameFlags::empty())
+        .await?;
+
+    // A signal sent to the name, one sent to the unique name of its owner, and a broadcast one.
+    let emitter = connection::Builder::address(address.as_str())
+        .build()
+        .await?;
+    for (destination, member) in [
+        (Some(NAME), "ToWellKnownName"),
+        (Some(owner_name.as_str()), "ToUniqueName"),
+        (None, "Broadcast"),
+    ] {
+        emitter
+            .emit_signal(destination, PATH, INTERFACE, member, &())
+            .await?;
+    }
+
+    // The snooper only gets the broadcast signal, which came last.
+    let msg = snooped.try_next().await?.unwrap();
+    let header = msg.header();
+    let member = header.member().unwrap();
+    ensure!(member == "Broadcast", "the snooper got `{member}` first");
 
     Ok(())
 }
