@@ -14,15 +14,15 @@ Alpha. It's not ready for production use yet. Only the essentials are in place.
 
 ## Performance
 
-busd keeps up with [dbus-broker], the broker that most systems run, where the bus is busy, and is
-well ahead of [dbus-daemon]. Measured with [dbus-bench] on a laptop with an AMD Ryzen 7 7840U,
+busd is close behind [dbus-broker], the broker that most systems run, while it needs less memory,
+and well ahead of [dbus-daemon]. Measured with [dbus-bench] on a laptop with an AMD Ryzen 7 7840U,
 running Fedora 44, as the median of 15 runs:
 
 | Broker             | 1 client | 20 clients | CPU time with 20 clients | Peak memory |
 |--------------------|---------:|-----------:|-------------------------:|------------:|
-| busd               |  0.088 s |    0.926 s |                   0.42 s |     6.3 MiB |
-| dbus-broker 37     |  0.082 s |    0.930 s |                   0.41 s |     7.9 MiB |
-| dbus-daemon 1.16.2 |  0.160 s |    1.185 s |                   1.14 s |     6.0 MiB |
+| busd               |  0.070 s |    0.475 s |                   0.37 s |     6.4 MiB |
+| dbus-broker 37     |  0.062 s |    0.451 s |                   0.31 s |     8.1 MiB |
+| dbus-daemon 1.16.2 |  0.142 s |    1.195 s |                   1.17 s |     6.1 MiB |
 
 Each client makes 1000 method calls with 16 KiB of data each, and the 20 clients make theirs all
 at once. With 20 clients, the benchmark's client keeps its own CPU busy with busd and dbus-broker
