@@ -84,3 +84,8 @@ split-debuginfo = "packed"
 strip = "symbols"
 # No one needs an undebuggable release binary
 debug = "full"
+
+# zruntime's `signal` module is in no release yet: build against its main branch, which has it,
+# until one is out.
+[patch.crates-io]
+zruntime = { git = "https://github.com/z-galaxy/zruntime" }
