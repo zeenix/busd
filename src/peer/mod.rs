@@ -88,8 +88,16 @@ impl Peer {
     ///
     /// Same as [`MatchRules::matches`].
     pub fn interested(&self, msg: &zbus::Message, name_registry: &NameRegistry) -> bool {
-        msg.header().destination() == Some(&BusName::Unique(self.unique_name.as_ref()))
-            || self.match_rules.matches(msg, name_registry)
+        // A message goes to its destination, whatever the match rules of the destination.
+        let for_us = match msg.header().destination() {
+            Some(BusName::Unique(name)) => *name == *self.unique_name,
+            Some(BusName::WellKnown(name)) => name_registry
+                .lookup(name.clone())
+                .is_some_and(|owner| owner == self.unique_name),
+            None => false,
+        };
+
+        for_us || self.match_rules.matches(msg, name_registry)
     }
 
     pub fn add_match_rule(&mut self, rule: OwnedMatchRule) {
