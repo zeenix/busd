@@ -89,8 +89,9 @@ impl Recipient {
 /// call waits for its reply by default, with libdbus, GDBus and sd-bus: the bus forwards the
 /// messages of each sender one after the other, so a client that stops reading while it is
 /// subscribed to the signals of the bus holds up every message of the bus, its replies included,
-/// for this long before it gets disconnected, and for as many times this long on a signal that
-/// several such clients are subscribed to.
+/// for this long before it gets disconnected. Several such clients that stop taking messages at the
+/// same one hold it up for this long all together, as the bus sends a message to all of its
+/// recipients at once.
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]

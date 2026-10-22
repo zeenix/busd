@@ -116,6 +116,18 @@ fn concurrent_timeouts() {
     zruntime::block_on(with_bus(SHORT_TIMEOUT, concurrent_timeouts_));
 }
 
+/// Clients that stop reading, which the same signals go to, hold those signals up for the time
+/// limit of the bus, all together, rather than for the time limit each: the bus waits on them at
+/// once.
+#[test]
+#[instrument]
+#[timeout(30000)]
+fn stalled_subscribers() {
+    init_tracing();
+
+    zruntime::block_on(with_bus(SHORT_TIMEOUT, stalled_subscribers_));
+}
+
 /// A client that goes while the bus waits for it to read is removed once, and the bus carries on.
 #[test]
 #[instrument]
@@ -474,6 +486,48 @@ async fn concurrent_timeouts_(address: String) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn stalled_subscribers_(address: String) -> anyhow::Result<()> {
+    let observer = connect(&address).await?;
+    let mut changes = all_owner_changes(&observer).await?;
+    let mut stalled = vec![];
+    for _ in 0..STALLED_SUBSCRIBERS {
+        stalled.push(stalled_subscriber(&address).await?);
+    }
+    let mut left: Vec<_> = stalled
+        .iter()
+        .map(|(conn, _)| conn.unique_name().unwrap().to_string())
+        .collect();
+
+    let flooder = connect(&address).await?;
+    let started = Instant::now();
+    flood(&flooder, FLOOD_SIGNALS).await?;
+
+    // The bus disconnects the stalled clients once it has waited on them for the time limit, which
+    // it does for all of them at once.
+    while !left.is_empty() {
+        let (changed, old_owner, new_owner) = next_owner_change(&mut changes).await?;
+        if old_owner == changed && new_owner.is_empty() {
+            left.retain(|name| *name != changed);
+        }
+    }
+    let waited = started.elapsed();
+    ensure!(
+        waited >= SHORT_TIMEOUT,
+        "the stalled clients went after {waited:?}"
+    );
+    // Waiting on them in turn would take the time limit as many times as there are of them.
+    let in_turn = SHORT_TIMEOUT * STALLED_SUBSCRIBERS as u32;
+    ensure!(
+        waited < in_turn - SHORT_TIMEOUT,
+        "the stalled clients went after {waited:?}, as if the bus waited on them in turn"
+    );
+
+    // The flooder stays.
+    DBusProxy::new(&flooder).await?.get_id().await?;
+
+    Ok(())
+}
+
 async fn leaving_client_(address: String) -> anyhow::Result<()> {
     let observer = connect(&address).await?;
     let mut changes = all_owner_changes(&observer).await?;
@@ -761,6 +815,9 @@ const LONG_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the client of `slow_client` doesn't read.
 const PAUSE: Duration = Duration::from_millis(300);
+
+/// How many clients of `stalled_subscribers` stop reading.
+const STALLED_SUBSCRIBERS: usize = 5;
 
 /// How long the bus waits for the client of `partial_write` to read: long enough for the second
 /// signal to come while the bus waits.

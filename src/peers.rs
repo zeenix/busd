@@ -1,7 +1,7 @@
 use crate::{debug, trace, warn};
 use anyhow::{bail, Context, Result};
 use futures_util::{
-    future::{select, Either},
+    future::{join_all, select, Either},
     stream::StreamExt,
 };
 use std::{
@@ -31,7 +31,10 @@ use crate::{
 /// other, from the task that serves the peer, so that each recipient gets them in the order that
 /// the peer sent them, monitors included. It picks the recipients of a message while it holds the
 /// locks of the peers, monitors and names, and only sends the message once it has let go of them,
-/// as a send may wait for its recipient to read.
+/// as a send may wait for its recipient to read. It sends the message to all of its recipients at
+/// once, so that those that don't read hold it up for as long as the slowest of them, rather than
+/// for as long as all of them together, and goes on to the next message once each recipient has
+/// taken it or been disconnected.
 #[derive(Debug)]
 pub struct Peers {
     peers: RwLock<BTreeMap<OwnedUniqueName, Peer>>,
@@ -310,25 +313,18 @@ impl Peers {
     }
 
     async fn send_msg_to_unique_name(&self, msg: Message, destination: UniqueName<'_>) {
-        let recipient = self
-            .peers
-            .read()
-            .await
-            .get(destination.as_str())
-            .map(|peer| peer.recipient().clone());
-        let mut monitors = Vec::new();
-        {
-            let name_registry = self.name_registry().await;
-            self.add_monitors(&msg, &name_registry, &mut monitors).await;
-        }
-
-        match recipient {
-            Some(recipient) => recipient.send(&msg).await,
+        let mut recipients = Vec::new();
+        match self.peers.read().await.get(destination.as_str()) {
+            Some(peer) => recipients.push(peer.recipient().clone()),
             None => debug!("no peer for destination `{destination}`"),
         }
-        for monitor in monitors {
-            monitor.send(&msg).await;
+        {
+            let name_registry = self.name_registry().await;
+            self.add_monitors(&msg, &name_registry, &mut recipients)
+                .await;
         }
+
+        send_to_all(&msg, &recipients).await;
     }
 
     async fn broadcast_msg(&self, msg: Message) {
@@ -349,9 +345,7 @@ impl Peers {
                 .await;
         }
 
-        for recipient in recipients {
-            recipient.send(&msg).await;
-        }
+        send_to_all(&msg, &recipients).await;
     }
 
     /// Add the monitors that `msg` goes to, to `recipients`.
@@ -386,5 +380,16 @@ impl Peers {
     fn bus_conn(&self) -> MutexGuard<'_, Option<Connection>> {
         // Nothing can panic while the lock is held.
         self.bus_conn.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Send `msg` to all of `recipients` at once.
+async fn send_to_all(msg: &Message, recipients: &[Recipient]) {
+    match recipients {
+        [] => (),
+        [recipient] => recipient.send(msg).await,
+        recipients => {
+            join_all(recipients.iter().map(|recipient| recipient.send(msg))).await;
+        }
     }
 }
