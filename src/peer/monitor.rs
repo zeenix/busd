@@ -9,12 +9,13 @@ use zbus::{
 
 use crate::{match_rules::MatchRules, name_registry::NameRegistry};
 
-use super::Peer;
+use super::{Peer, Recipient};
 
 /// A peer connection.
 #[derive(Debug)]
 pub struct Monitor {
     conn: Connection,
+    recipient: Recipient,
     unique_name: OwnedUniqueName,
     match_rules: MatchRules,
 }
@@ -22,6 +23,11 @@ pub struct Monitor {
 impl Monitor {
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Where the bus sends the messages for the monitor: where it sent those for its peer.
+    pub fn recipient(&self) -> &Recipient {
+        &self.recipient
     }
 
     pub fn unique_name(&self) -> &OwnedUniqueName {
@@ -59,6 +65,7 @@ impl Monitor {
     pub(super) fn new(peer: Peer, match_rules: MatchRules) -> Self {
         Self {
             conn: peer.conn().clone(),
+            recipient: peer.recipient().clone(),
             unique_name: peer.unique_name().clone(),
             match_rules,
         }

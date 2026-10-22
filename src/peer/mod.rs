@@ -3,9 +3,12 @@ pub use stream::*;
 use zruntime::{Event, EventListener};
 mod monitor;
 pub use monitor::*;
+mod recipient;
+pub use recipient::*;
 
 use crate::trace;
 use anyhow::Result;
+use std::time::Duration;
 use zbus::{
     connection::{self, AuthMechanism},
     names::{BusName, OwnedUniqueName},
@@ -18,6 +21,7 @@ use crate::{fdo, match_rules::MatchRules, name_registry::NameRegistry};
 #[derive(Debug)]
 pub struct Peer {
     conn: Connection,
+    recipient: Recipient,
     unique_name: OwnedUniqueName,
     match_rules: MatchRules,
     greeted: bool,
@@ -30,6 +34,7 @@ impl Peer {
         id: usize,
         builder: connection::Builder<'_>,
         auth_mechanism: AuthMechanism,
+        send_timeout: Duration,
     ) -> Result<(Self, Stream)> {
         let unique_name = OwnedUniqueName::try_from(format!(":busd.{id}")).unwrap();
         // Use `build_message_stream` to activate a message receiver before the socket reader
@@ -46,6 +51,7 @@ impl Peer {
         trace!("created: {:?}", conn);
 
         let peer = Self {
+            recipient: Recipient::client(conn.clone(), unique_name.clone(), send_timeout)?,
             conn,
             unique_name,
             match_rules: MatchRules::default(),
@@ -62,6 +68,7 @@ impl Peer {
         let conn = Connection::from(&msg_stream);
 
         let peer = Self {
+            recipient: Recipient::bus(conn.clone()),
             conn,
             unique_name,
             match_rules: MatchRules::default(),
@@ -78,6 +85,11 @@ impl Peer {
 
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Where the bus sends the messages for the peer.
+    pub fn recipient(&self) -> &Recipient {
+        &self.recipient
     }
 
     pub fn listen_cancellation(&self) -> EventListener {

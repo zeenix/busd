@@ -7,13 +7,14 @@ use futures_util::{
 use std::{
     collections::BTreeMap,
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::Duration,
 };
 use zbus::{
     connection::{self, AuthMechanism},
     message,
     names::{BusName, OwnedUniqueName, UniqueName},
-    Message, Optional, OwnedGuid,
+    Connection, Message, Optional, OwnedGuid,
 };
 use zruntime::{lock::RwLock, spawn, EventListener};
 
@@ -21,14 +22,24 @@ use crate::{
     fdo,
     match_rules::MatchRules,
     name_registry::{NameOwnerChanged, NameRegistry},
-    peer::{Monitor, Peer, Stream, MAX_MESSAGE_FDS},
+    peer::{Monitor, Peer, Recipient, Stream, MAX_MESSAGE_FDS},
 };
 
+/// The peers of the bus, and its monitors and names.
+///
+/// The bus forwards the messages of each peer, including those of the bus itself, one after the
+/// other, from the task that serves the peer, so that each recipient gets them in the order that
+/// the peer sent them, monitors included. It picks the recipients of a message while it holds the
+/// locks of the peers, monitors and names, and only sends the message once it has let go of them,
+/// as a send may wait for its recipient to read.
 #[derive(Debug)]
 pub struct Peers {
     peers: RwLock<BTreeMap<OwnedUniqueName, Peer>>,
     monitors: RwLock<BTreeMap<OwnedUniqueName, Monitor>>,
     name_registry: RwLock<NameRegistry>,
+    /// The connection on which the bus serves the D-Bus API, from when the bus is among its peers
+    /// until the bus goes.
+    bus_conn: Mutex<Option<Connection>>,
 }
 
 impl Peers {
@@ -39,20 +50,24 @@ impl Peers {
             peers: RwLock::new(BTreeMap::new()),
             monitors: RwLock::new(BTreeMap::new()),
             name_registry: RwLock::new(name_registry),
+            bus_conn: Mutex::new(None),
         })
     }
 
+    /// Add a client, which the bus gives `send_timeout` to take each message.
     pub async fn add(
         self: &Arc<Self>,
         guid: &OwnedGuid,
         id: usize,
         builder: connection::Builder<'_>,
         auth_mechanism: AuthMechanism,
+        send_timeout: Duration,
     ) -> Result<()> {
         // Perform the connection build and SASL handshake without holding the peers lock, as it
         // involves async I/O and would otherwise block all other peer operations (Hello
         // handling, etc.).
-        let (peer, peer_stream) = Peer::new(guid.clone(), id, builder, auth_mechanism).await?;
+        let (peer, peer_stream) =
+            Peer::new(guid.clone(), id, builder, auth_mechanism, send_timeout).await?;
         let unique_name = peer.unique_name().clone();
         let listener = peer.listen_cancellation();
 
@@ -75,7 +90,10 @@ impl Peers {
         Ok(())
     }
 
-    pub async fn add_us(self: &Arc<Self>, msg_stream: zbus::MessageStream) {
+    /// Add the bus itself, which serves the D-Bus API on `conn`: what the bus sends on it comes out
+    /// of `msg_stream`.
+    pub async fn add_us(self: &Arc<Self>, msg_stream: zbus::MessageStream, conn: Connection) {
+        *self.bus_conn() = Some(conn);
         let (peer, peer_stream) = Peer::new_us(msg_stream).await;
         let unique_name = peer.unique_name().clone();
         let listener = peer.listen_cancellation();
@@ -95,6 +113,15 @@ impl Peers {
                 peers.insert(unique_name.clone(), peer);
             }
         }
+    }
+
+    /// Let go of the connection on which the bus serves the D-Bus API, as the bus goes.
+    ///
+    /// What the bus sends on that connection comes back to it as the messages of its own peer, so
+    /// holding on to the connection would keep the task that serves that peer, and with it the
+    /// peers, from ever ending.
+    pub fn remove_us(&self) {
+        self.bus_conn().take();
     }
 
     pub async fn peers(&self) -> impl Deref<Target = BTreeMap<OwnedUniqueName, Peer>> + '_ {
@@ -148,7 +175,12 @@ impl Peers {
         true
     }
 
+    /// Signal a change of the owner of a name.
+    ///
+    /// The signals go out on the connection of the bus, like its replies and its other signals,
+    /// so that they all reach each recipient in the order that the bus sends them.
     pub async fn notify_name_changes(&self, name_owner_changed: NameOwnerChanged) -> Result<()> {
+        let bus = self.bus_conn().clone().context("The bus isn't up")?;
         let name = BusName::from(name_owner_changed.name);
         let old_owner = name_owner_changed.old_owner.map(UniqueName::from);
         let new_owner = name_owner_changed.new_owner.map(UniqueName::from);
@@ -161,26 +193,22 @@ impl Peers {
                 Optional::from(old_owner.clone()),
                 Optional::from(new_owner.clone()),
             ))?;
-        self.broadcast_msg(msg).await;
+        bus.send(&msg).await?;
 
         // Now unicast the appropriate signal to the old and new owners.
         if let Some(old_owner) = old_owner {
             let msg = Message::signal(fdo::DBus::PATH, fdo::DBus::INTERFACE, "NameLost")
                 .sender(fdo::BUS_NAME)
-                .destination(old_owner.clone())
+                .destination(old_owner)
                 .build(&name)?;
-            if let Err(e) = self.send_msg_to_unique_name(msg, old_owner.clone()).await {
-                warn!("Couldn't notify inexistant peer {old_owner} about loosing name {name}: {e}")
-            }
+            bus.send(&msg).await?;
         }
         if let Some(new_owner) = new_owner {
             let msg = Message::signal(fdo::DBus::PATH, fdo::DBus::INTERFACE, "NameAcquired")
                 .sender(fdo::BUS_NAME)
-                .destination(new_owner.clone())
+                .destination(new_owner)
                 .build(&name)?;
-            if let Err(e) = self.send_msg_to_unique_name(msg, new_owner.clone()).await {
-                warn!("Couldn't notify peer {new_owner} about acquiring name {name}: {e}")
-            }
+            bus.send(&msg).await?;
         }
 
         Ok(())
@@ -277,52 +305,62 @@ impl Peers {
                 self.send_msg_to_unique_name(msg, (&*dest).into()).await
             }
         }
-    }
-
-    async fn send_msg_to_unique_name(
-        &self,
-        msg: Message,
-        destination: UniqueName<'_>,
-    ) -> Result<()> {
-        let conn = self
-            .peers
-            .read()
-            .await
-            .get(destination.as_str())
-            .map(|peer| peer.conn().clone());
-        match conn {
-            Some(conn) => conn.send(&msg).await.context("failed to send message")?,
-            None => debug!("no peer for destination `{destination}`"),
-        }
-        let name_registry = self.name_registry().await;
-        self.broadcast_to_monitors(msg, &name_registry).await;
 
         Ok(())
     }
 
-    async fn broadcast_msg(&self, msg: Message) {
-        trace!("Broadcasting message: {:?}", msg);
-        let name_registry = self.name_registry().await;
-        for peer in self.peers.read().await.values() {
-            if !peer.interested(&msg, &name_registry) {
-                trace!("Peer {} not interested in {msg:?}", peer.unique_name());
-                continue;
-            }
-
-            if let Err(e) = peer
-                .conn()
-                .send(&msg)
-                .await
-                .context("failed to send message")
-            {
-                warn!("Error sending message: {}", e);
-            }
+    async fn send_msg_to_unique_name(&self, msg: Message, destination: UniqueName<'_>) {
+        let recipient = self
+            .peers
+            .read()
+            .await
+            .get(destination.as_str())
+            .map(|peer| peer.recipient().clone());
+        let mut monitors = Vec::new();
+        {
+            let name_registry = self.name_registry().await;
+            self.add_monitors(&msg, &name_registry, &mut monitors).await;
         }
 
-        self.broadcast_to_monitors(msg, &name_registry).await;
+        match recipient {
+            Some(recipient) => recipient.send(&msg).await,
+            None => debug!("no peer for destination `{destination}`"),
+        }
+        for monitor in monitors {
+            monitor.send(&msg).await;
+        }
     }
 
-    async fn broadcast_to_monitors(&self, msg: Message, name_registry: &NameRegistry) {
+    async fn broadcast_msg(&self, msg: Message) {
+        trace!("Broadcasting message: {:?}", msg);
+        let mut recipients = Vec::new();
+        {
+            let name_registry = self.name_registry().await;
+            for peer in self.peers.read().await.values() {
+                if !peer.interested(&msg, &name_registry) {
+                    trace!("Peer {} not interested in {msg:?}", peer.unique_name());
+                    continue;
+                }
+
+                recipients.push(peer.recipient().clone());
+            }
+
+            self.add_monitors(&msg, &name_registry, &mut recipients)
+                .await;
+        }
+
+        for recipient in recipients {
+            recipient.send(&msg).await;
+        }
+    }
+
+    /// Add the monitors that `msg` goes to, to `recipients`.
+    async fn add_monitors(
+        &self,
+        msg: &Message,
+        name_registry: &NameRegistry,
+        recipients: &mut Vec<Recipient>,
+    ) {
         let monitors = self.monitors.read().await;
         if monitors.is_empty() {
             return;
@@ -333,7 +371,7 @@ impl Peers {
             msg
         );
         for monitor in monitors.values() {
-            if !monitor.interested(&msg, name_registry) {
+            if !monitor.interested(msg, name_registry) {
                 trace!(
                     "Monitor {} not interested in {msg:?}",
                     monitor.unique_name()
@@ -341,14 +379,12 @@ impl Peers {
                 continue;
             }
 
-            if let Err(e) = monitor
-                .conn()
-                .send(&msg)
-                .await
-                .context("failed to send message")
-            {
-                warn!("Error sending message: {}", e);
-            }
+            recipients.push(monitor.recipient().clone());
         }
+    }
+
+    fn bus_conn(&self) -> MutexGuard<'_, Option<Connection>> {
+        // Nothing can panic while the lock is held.
+        self.bus_conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }

@@ -210,14 +210,16 @@ impl DBus {
         bus_name: BusName<'_>,
     ) -> Result<Arc<ConnectionCredentials>> {
         let owner = self.get_name_owner(bus_name.clone()).await?;
-        let peers = self.peers()?;
-        let peers = peers.peers().await;
-
-        let peer_info = peers
+        // Not under the lock of the peers: this waits for any send to the peer that is under way.
+        let conn = self
+            .peers()?
+            .peers()
+            .await
             .get(&owner)
+            .map(|peer| peer.conn().clone())
             .ok_or_else(|| Error::Failed(format!("Peer `{bus_name}` not found")))?;
 
-        peer_info.conn().peer_creds().await.cloned().map_err(|e| {
+        conn.peer_creds().await.cloned().map_err(|e| {
             Error::Failed(format!(
                 "Failed to get peer credentials for `{bus_name}`: {e}"
             ))
