@@ -13,7 +13,7 @@ use zbus::{
     connection::{self, AuthMechanism},
     message,
     names::{BusName, OwnedUniqueName, UniqueName},
-    Connection, Message, Optional, OwnedGuid,
+    Message, Optional, OwnedGuid,
 };
 use zruntime::{lock::RwLock, spawn, EventListener};
 
@@ -21,7 +21,7 @@ use crate::{
     fdo,
     match_rules::MatchRules,
     name_registry::{NameOwnerChanged, NameRegistry},
-    peer::{Monitor, Peer, Recipient, Stream, MAX_MESSAGE_FDS},
+    peer::{Monitor, Peer, Stream, MAX_MESSAGE_FDS},
 };
 
 #[derive(Debug)]
@@ -238,7 +238,7 @@ impl Peers {
 
         // Stream is done means the peer disconnected or it became a monitor, unless the peer sent
         // a message that gets it disconnected. Remove it from the list of peers: that, and the end
-        // of its stream, close its connection once its queue is written.
+        // of its stream, close its connection.
         if self.peers_mut().await.remove(&unique_name).is_none() {
             // This means peer was turned into a monitor. `Monitoring` iface will emit the signals.
             return Ok(());
@@ -284,62 +284,45 @@ impl Peers {
         msg: Message,
         destination: UniqueName<'_>,
     ) -> Result<()> {
-        // Queuing never waits, so it's done while holding the locks, but a message for the bus
-        // itself is only sent once they are released, as the bus may need them to make room.
-        let bus = match self.peers.read().await.get(destination.as_str()) {
-            Some(peer) => peer
-                .recipient()
-                .queue(&msg)
-                .context("failed to send message")?,
-            None => {
-                debug!("no peer for destination `{destination}`");
-
-                None
-            }
-        };
-        if let Some(bus) = bus {
-            bus.send(&msg).await.context("failed to send message")?;
+        let conn = self
+            .peers
+            .read()
+            .await
+            .get(destination.as_str())
+            .map(|peer| peer.conn().clone());
+        match conn {
+            Some(conn) => conn.send(&msg).await.context("failed to send message")?,
+            None => debug!("no peer for destination `{destination}`"),
         }
-        let mut buses = Vec::new();
-        {
-            let name_registry = self.name_registry().await;
-            self.queue_for_monitors(&msg, &name_registry, &mut buses)
-                .await;
-        }
-        send_to_buses(&msg, buses).await;
+        let name_registry = self.name_registry().await;
+        self.broadcast_to_monitors(msg, &name_registry).await;
 
         Ok(())
     }
 
     async fn broadcast_msg(&self, msg: Message) {
         trace!("Broadcasting message: {:?}", msg);
-        // Queuing never waits, so it's done while holding the locks, but a message for the bus
-        // itself is only sent once they are released, as the bus may need them to make room.
-        let mut buses = Vec::new();
-        {
-            let name_registry = self.name_registry().await;
-            for peer in self.peers.read().await.values() {
-                if !peer.interested(&msg, &name_registry) {
-                    trace!("Peer {} not interested in {msg:?}", peer.unique_name());
-                    continue;
-                }
-
-                queue(peer.recipient(), &msg, &mut buses);
+        let name_registry = self.name_registry().await;
+        for peer in self.peers.read().await.values() {
+            if !peer.interested(&msg, &name_registry) {
+                trace!("Peer {} not interested in {msg:?}", peer.unique_name());
+                continue;
             }
 
-            self.queue_for_monitors(&msg, &name_registry, &mut buses)
-                .await;
+            if let Err(e) = peer
+                .conn()
+                .send(&msg)
+                .await
+                .context("failed to send message")
+            {
+                warn!("Error sending message: {}", e);
+            }
         }
-        send_to_buses(&msg, buses).await;
+
+        self.broadcast_to_monitors(msg, &name_registry).await;
     }
 
-    /// Queue `msg` for the monitors that are interested in it, as [`queue`] does.
-    async fn queue_for_monitors(
-        &self,
-        msg: &Message,
-        name_registry: &NameRegistry,
-        buses: &mut Vec<Connection>,
-    ) {
+    async fn broadcast_to_monitors(&self, msg: Message, name_registry: &NameRegistry) {
         let monitors = self.monitors.read().await;
         if monitors.is_empty() {
             return;
@@ -350,7 +333,7 @@ impl Peers {
             msg
         );
         for monitor in monitors.values() {
-            if !monitor.interested(msg, name_registry) {
+            if !monitor.interested(&msg, name_registry) {
                 trace!(
                     "Monitor {} not interested in {msg:?}",
                     monitor.unique_name()
@@ -358,26 +341,14 @@ impl Peers {
                 continue;
             }
 
-            queue(monitor.recipient(), msg, buses);
-        }
-    }
-}
-
-/// Queue `msg` for `recipient`, or, if it is the bus itself, add the bus's connection to `buses`,
-/// for `msg` to be sent on once no lock is held. A failure to queue is logged.
-fn queue(recipient: &Recipient, msg: &Message, buses: &mut Vec<Connection>) {
-    match recipient.queue(msg) {
-        Ok(Some(bus)) => buses.push(bus),
-        Ok(None) => (),
-        Err(e) => warn!("Error sending message: {}", e),
-    }
-}
-
-/// Send `msg` to the bus itself, on each of `buses`, and log the sends that fail.
-async fn send_to_buses(msg: &Message, buses: Vec<Connection>) {
-    for bus in buses {
-        if let Err(e) = bus.send(msg).await {
-            warn!("Error sending message: {}", e);
+            if let Err(e) = monitor
+                .conn()
+                .send(&msg)
+                .await
+                .context("failed to send message")
+            {
+                warn!("Error sending message: {}", e);
+            }
         }
     }
 }

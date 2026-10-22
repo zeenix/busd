@@ -3,8 +3,6 @@ pub use stream::*;
 use zruntime::{Event, EventListener};
 mod monitor;
 pub use monitor::*;
-mod outgoing;
-pub use outgoing::*;
 
 use crate::trace;
 use anyhow::Result;
@@ -20,7 +18,6 @@ use crate::{fdo, match_rules::MatchRules, name_registry::NameRegistry};
 #[derive(Debug)]
 pub struct Peer {
     conn: Connection,
-    recipient: Recipient,
     unique_name: OwnedUniqueName,
     match_rules: MatchRules,
     greeted: bool,
@@ -49,7 +46,6 @@ impl Peer {
         trace!("created: {:?}", conn);
 
         let peer = Self {
-            recipient: Recipient::Client(Outgoing::new(conn.clone(), unique_name.clone())),
             conn,
             unique_name,
             match_rules: MatchRules::default(),
@@ -66,7 +62,6 @@ impl Peer {
         let conn = Connection::from(&msg_stream);
 
         let peer = Self {
-            recipient: Recipient::Bus(conn.clone()),
             conn,
             unique_name,
             match_rules: MatchRules::default(),
@@ -83,11 +78,6 @@ impl Peer {
 
     pub fn conn(&self) -> &Connection {
         &self.conn
-    }
-
-    /// Where messages for the peer go.
-    pub fn recipient(&self) -> &Recipient {
-        &self.recipient
     }
 
     pub fn listen_cancellation(&self) -> EventListener {
@@ -143,3 +133,9 @@ impl Drop for Peer {
         self.canceled_event.notify(usize::MAX);
     }
 }
+
+/// How many file descriptors a message may carry: as many as Linux passes in one write
+/// (`SCM_MAX_FD`), which is how zbus passes those of a message.
+///
+/// The bus couldn't pass a message with more on, so it disconnects a client that sends one.
+pub const MAX_MESSAGE_FDS: usize = 253;
