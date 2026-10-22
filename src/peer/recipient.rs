@@ -84,15 +84,17 @@ impl Recipient {
 /// The wait counts from when the bus starts to send the message, so it covers the wait for the
 /// other messages on their way to the client, as well as the write of this one.
 ///
-/// It is long enough for a client that reads its socket to take even the largest message, of
-/// 128 MiB, as that only takes reading at 128 MiB/s. And it is short next to the 25 s that a method
-/// call waits for its reply by default, with libdbus, GDBus and sd-bus: the bus forwards the
-/// messages of each sender one after the other, so a client that stops reading while it is
-/// subscribed to the signals of the bus holds up every message of the bus, its replies included,
-/// for this long before it gets disconnected. Several such clients that stop taking messages at the
-/// same one hold it up for this long all together, as the bus sends a message to all of its
-/// recipients at once.
-pub const SEND_TIMEOUT: Duration = Duration::from_secs(1);
+/// The bus forwards the messages of each sender one after the other, so a client that stops
+/// reading while it is subscribed to the signals of the bus holds up every message of the bus, its
+/// replies included, for this long before it gets disconnected. Several such clients that stop
+/// taking messages at the same one hold it up for this long all together, as the bus sends a
+/// message to all of its recipients at once. That is why this is short: a holdup of 100 ms is
+/// barely noticeable, and nothing next to the 25 s that a method call waits for its reply by
+/// default, with libdbus, GDBus and sd-bus. The cost is that a client has to keep up with what it
+/// gets: one that reads at 128 MiB/s takes messages of up to 12.8 MiB in this time, but the
+/// largest messages, of 128 MiB, take reading at 1.25 GiB/s, and a client that gets stuck for
+/// longer than this, with a message waiting for it that its socket can't take, gets disconnected.
+pub const SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 enum Kind {
