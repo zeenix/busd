@@ -88,3 +88,11 @@ debug = "full"
 [patch.crates-io.zruntime]
 git = "https://github.com/z-galaxy/zruntime"
 rev = "99e2ebd807723177bec5d7c5216e48448c3a91c9"
+
+# The bus writes the messages that it forwards to a client in one go, with `Connection::send_all`,
+# which no release of zbus has yet: z-galaxy/zbus#2078 asks for it, and the `ccr-fd1ce738-0xtuf0`
+# branch of zeenix/zbus adds it. Patching crates.io's zbus, rather than depending on it from git,
+# has the tests, which depend on zbus too, build on it as well.
+[patch.crates-io.zbus]
+git = "https://github.com/zeenix/zbus"
+rev = "f9e8086104cb0484c4ef5e3339160370f1fa3e9e"
