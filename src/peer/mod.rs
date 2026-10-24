@@ -3,11 +3,12 @@ pub use stream::*;
 use zruntime::{Event, EventListener};
 mod monitor;
 pub use monitor::*;
-mod outgoing;
-pub use outgoing::*;
+mod recipient;
+pub use recipient::*;
 
 use crate::trace;
 use anyhow::Result;
+use std::time::Duration;
 use zbus::{
     connection::{self, AuthMechanism},
     names::{BusName, OwnedUniqueName},
@@ -33,6 +34,7 @@ impl Peer {
         id: usize,
         builder: connection::Builder<'_>,
         auth_mechanism: AuthMechanism,
+        send_timeout: Duration,
     ) -> Result<(Self, Stream)> {
         let unique_name = OwnedUniqueName::try_from(format!(":busd.{id}")).unwrap();
         // Use `build_message_stream` to activate a message receiver before the socket reader
@@ -49,7 +51,7 @@ impl Peer {
         trace!("created: {:?}", conn);
 
         let peer = Self {
-            recipient: Recipient::Client(Outgoing::new(conn.clone(), unique_name.clone())),
+            recipient: Recipient::client(conn.clone(), unique_name.clone(), send_timeout)?,
             conn,
             unique_name,
             match_rules: MatchRules::default(),
@@ -66,7 +68,7 @@ impl Peer {
         let conn = Connection::from(&msg_stream);
 
         let peer = Self {
-            recipient: Recipient::Bus(conn.clone()),
+            recipient: Recipient::bus(conn.clone()),
             conn,
             unique_name,
             match_rules: MatchRules::default(),
@@ -85,7 +87,7 @@ impl Peer {
         &self.conn
     }
 
-    /// Where messages for the peer go.
+    /// Where the bus sends the messages for the peer.
     pub fn recipient(&self) -> &Recipient {
         &self.recipient
     }
@@ -143,3 +145,9 @@ impl Drop for Peer {
         self.canceled_event.notify(usize::MAX);
     }
 }
+
+/// How many file descriptors a message may carry: as many as Linux passes in one write
+/// (`SCM_MAX_FD`), which is how zbus passes those of a message.
+///
+/// The bus couldn't pass a message with more on, so it disconnects a client that sends one.
+pub const MAX_MESSAGE_FDS: usize = 253;

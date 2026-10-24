@@ -1,6 +1,6 @@
 use crate::{debug, info, trace, warn};
 use anyhow::{bail, Ok, Result};
-use std::{env, path::Path, str::FromStr, sync::Arc};
+use std::{env, path::Path, str::FromStr, sync::Arc, time::Duration};
 use zbus::{
     address::{
         transport::{Tcp, Unix, UnixSocket},
@@ -13,6 +13,7 @@ use zruntime::{fs::remove_file, spawn, Shared, SharedRuntime};
 
 use crate::{
     fdo::{self, DBus, Monitoring},
+    peer::SEND_TIMEOUT,
     peers::Peers,
 };
 
@@ -36,6 +37,7 @@ pub struct Inner {
     guid: OwnedGuid,
     next_id: usize,
     auth_mechanism: AuthMechanism,
+    send_timeout: Duration,
     _self_conn: Connection,
 }
 
@@ -101,7 +103,7 @@ impl Bus {
             .build_message_stream()
             .await?;
 
-        peers.add_us(peer_stream).await;
+        peers.add_us(peer_stream, service_conn.clone()).await;
         trace!("Self-dial connection created.");
 
         Ok(Self {
@@ -112,6 +114,7 @@ impl Bus {
                 guid,
                 next_id: 0,
                 auth_mechanism,
+                send_timeout: SEND_TIMEOUT,
                 _self_conn: service_conn,
             },
         })
@@ -119,6 +122,14 @@ impl Bus {
 
     pub fn address(&self) -> &Address {
         &self.inner.address
+    }
+
+    /// Set how long the bus waits for a client to take a message, before it disconnects the client.
+    ///
+    /// It is [`SEND_TIMEOUT`] unless set otherwise, and applies to the clients that connect from
+    /// then on.
+    pub fn set_send_timeout(&mut self, timeout: Duration) {
+        self.inner.send_timeout = timeout;
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -214,7 +225,13 @@ impl Bus {
             let res = inner
                 .peers
                 .clone()
-                .add(&inner.guid, id, builder, inner.auth_mechanism)
+                .add(
+                    &inner.guid,
+                    id,
+                    builder,
+                    inner.auth_mechanism,
+                    inner.send_timeout,
+                )
                 .await;
             if let Err(e) = res {
                 warn!("Failed to establish connection: {}", e);
@@ -259,6 +276,12 @@ impl Bus {
         self.inner.next_id += 1;
 
         self.inner.next_id
+    }
+}
+
+impl Drop for Bus {
+    fn drop(&mut self) {
+        self.inner.peers.remove_us();
     }
 }
 

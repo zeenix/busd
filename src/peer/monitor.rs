@@ -25,7 +25,7 @@ impl Monitor {
         &self.conn
     }
 
-    /// Where messages for the monitor go: the queue that it had as a peer.
+    /// Where the bus sends the messages for the monitor: where it sent those for its peer.
     pub fn recipient(&self) -> &Recipient {
         &self.recipient
     }
