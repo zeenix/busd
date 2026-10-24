@@ -81,3 +81,10 @@ split-debuginfo = "packed"
 strip = "symbols"
 # No one needs an undebuggable release binary
 debug = "full"
+
+# The time limit on each send to a client reads the clock only once the send has to wait, as of
+# z-galaxy/zruntime#58, which no release of zruntime has yet. Patching crates.io's zruntime, rather
+# than depending on it from git, has zbus build on it too: busd and zbus must share one runtime.
+[patch.crates-io.zruntime]
+git = "https://github.com/z-galaxy/zruntime"
+rev = "99e2ebd807723177bec5d7c5216e48448c3a91c9"

@@ -1205,8 +1205,7 @@ dependencies = [
 [[package]]
 name = "zruntime"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfc035df602243402949ddf3dcc5bcfad7edeb732dd49ec6e605431c4eca54ce"
+source = "git+https://github.com/z-galaxy/zruntime?rev=99e2ebd807723177bec5d7c5216e48448c3a91c9#99e2ebd807723177bec5d7c5216e48448c3a91c9"
 dependencies = [
  "futures-core",
  "futures-io",
