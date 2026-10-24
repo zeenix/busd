@@ -161,6 +161,17 @@ fn client_without_fds() {
     zruntime::block_on(with_bus(LONG_TIMEOUT, client_without_fds_));
 }
 
+/// Messages that a client can't take, as they have file descriptors and the client didn't
+/// negotiate passing them, don't hold up those that the bus sends the client along with them.
+#[test]
+#[instrument]
+#[timeout(30000)]
+fn client_without_fds_in_a_batch() {
+    init_tracing();
+
+    zruntime::block_on(with_bus(LONG_TIMEOUT, client_without_fds_in_a_batch_));
+}
+
 /// A client that the bus can't write to anymore gets disconnected, even while the bus can still
 /// read from it.
 #[cfg(target_os = "linux")]
@@ -668,6 +679,42 @@ async fn client_without_fds_(address: String) -> anyhow::Result<()> {
 
     // The reply to a call of the client comes after the signal, and still gets to it.
     DBusProxy::new(&client).await?.get_id().await?;
+
+    Ok(())
+}
+
+async fn client_without_fds_in_a_batch_(address: String) -> anyhow::Result<()> {
+    let (client, _) = client_on_socket(&address).await?;
+    let client_name = client.unique_name().unwrap().to_owned();
+    let rule = MatchRule::builder()
+        .msg_type(message::Type::Signal)
+        .interface("org.zbus.Fds")
+        .build()?;
+    let mut signals = MessageStream::for_match_rule(rule, &client, None).await?;
+
+    // Signals for the client, one with a file descriptor between two without, which the sender
+    // sends at once, for the bus to forward them together.
+    let sender = connect(&address).await?;
+    let file = File::open("/dev/null")?;
+    let signal =
+        |member| Message::signal("/org/zbus/Fds", "org.zbus.Fds", member).destination(&client_name);
+    let msgs = [
+        signal("Before").build(&())?,
+        signal("WithFd").build(&Fd::from(&file))?,
+        signal("After").build(&())?,
+    ];
+    sender.send_all(&msgs).await?;
+
+    // The client gets the two without.
+    for expected in ["Before", "After"] {
+        let msg = signals.next().await.context("the stream ended")??;
+        let header = msg.header();
+        let member = header.member().map(|member| member.as_str());
+        ensure!(
+            member == Some(expected),
+            "got {member:?} rather than `{expected}`"
+        );
+    }
 
     Ok(())
 }
