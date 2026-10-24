@@ -5,9 +5,11 @@ use futures_util::{
     stream::StreamExt,
 };
 use std::{
-    collections::BTreeMap,
-    ops::{Deref, DerefMut},
+    collections::{hash_map::Entry, BTreeMap, HashMap},
+    future::poll_fn,
+    ops::{Deref, DerefMut, Range},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
+    task::Poll,
     time::Duration,
 };
 use zbus::{
@@ -27,14 +29,17 @@ use crate::{
 
 /// The peers of the bus, and its monitors and names.
 ///
-/// The bus forwards the messages of each peer, including those of the bus itself, one after the
-/// other, from the task that serves the peer, so that each recipient gets them in the order that
-/// the peer sent them, monitors included. It picks the recipients of a message while it holds the
-/// locks of the peers, monitors and names, and only sends the message once it has let go of them,
-/// as a send may wait for its recipient to read. It sends the message to all of its recipients at
-/// once, so that those that don't read hold it up for as long as the slowest of them, rather than
-/// for as long as all of them together, and goes on to the next message once each recipient has
-/// taken it or been disconnected.
+/// The bus forwards the messages of each peer, including those of the bus itself, from the task
+/// that serves the peer, a batch after the other: each batch is the messages that the peer sent by
+/// the time the bus gets to them, up to [`MAX_BATCH`] of them and [`MAX_BATCH_BYTES`]. Each
+/// recipient gets its messages of a batch in one go, so that its socket takes them with as few
+/// writes as it can, in the order that the peer sent them, monitors included. The bus picks the
+/// recipients of the messages of a batch while it holds the locks of the peers, monitors and
+/// names, and only sends the messages once it has let go of them, as a send may wait for its
+/// recipient to read. It sends the batch to all of its recipients at once, so that those that
+/// don't read hold it up for as long as the slowest of them, rather than for as long as all of
+/// them together, and goes on to the next batch once each recipient has taken its messages or
+/// been disconnected.
 #[derive(Debug)]
 pub struct Peers {
     peers: RwLock<BTreeMap<OwnedUniqueName, Peer>>,
@@ -223,6 +228,7 @@ impl Peers {
         mut cancellation_listener: EventListener,
         unique_name: OwnedUniqueName,
     ) -> Result<()> {
+        let mut batch = Vec::new();
         loop {
             let msg = match select(cancellation_listener, peer_stream.next()).await {
                 Either::Left(_) | Either::Right((None, _)) => {
@@ -233,18 +239,44 @@ impl Peers {
                 Either::Right((Some(msg), listener)) => {
                     cancellation_listener = listener;
 
-                    match msg {
-                        Ok(msg) => msg,
-                        Err(e) => {
-                            debug!("{e}");
-
-                            continue;
-                        }
-                    }
+                    msg
                 }
             };
-            // Passing such a message on would fail, and get its recipients disconnected.
-            if msg.data().fds().len() > MAX_MESSAGE_FDS {
+            // The messages that the peer sent after this one go along with it, as far as they are
+            // here already.
+            let mut next = Some(msg);
+            let mut bytes = 0;
+            let mut too_many_fds = false;
+            let mut ended = false;
+            while let Some(msg) = next.take() {
+                match msg {
+                    // Passing such a message on would fail, and get its recipients disconnected.
+                    Ok(msg) if msg.data().fds().len() > MAX_MESSAGE_FDS => {
+                        too_many_fds = true;
+
+                        break;
+                    }
+                    Ok(msg) => {
+                        bytes += msg.data().len();
+                        batch.push(msg);
+                    }
+                    Err(e) => debug!("{e}"),
+                }
+                if batch.len() == MAX_BATCH || bytes >= MAX_BATCH_BYTES {
+                    break;
+                }
+                // Polled with the waker of this task, which the stream keeps if it has nothing yet,
+                // for the wait for the next batch.
+                match poll_fn(|cx| Poll::Ready(peer_stream.poll_next_unpin(cx))).await {
+                    Poll::Ready(Some(msg)) => next = Some(msg),
+                    Poll::Ready(None) => ended = true,
+                    Poll::Pending => (),
+                }
+            }
+
+            self.forward(&batch).await?;
+            batch.clear();
+            if too_many_fds {
                 warn!(
                     "Disconnecting `{unique_name}`, as it sent a message with more than \
                      {MAX_MESSAGE_FDS} file descriptors"
@@ -252,19 +284,11 @@ impl Peers {
 
                 break;
             }
+            if ended {
+                trace!("Peer `{}` disconnected", unique_name);
 
-            match msg.message_type() {
-                message::Type::Signal => self.broadcast_msg(msg).await,
-                _ => match msg.header().destination() {
-                    Some(dest) => {
-                        if let Err(e) = self.send_msg(msg.clone(), dest.clone()).await {
-                            warn!("{}", e);
-                        }
-                    }
-                    // peer::Stream ensures a valid destination so this isn't exactly needed.
-                    _ => bail!("invalid message: {:?}", msg),
-                },
-            };
+                break;
+            }
         }
 
         // Stream is done means the peer disconnected or it became a monitor, unless the peer sent
@@ -292,89 +316,87 @@ impl Peers {
         Ok(())
     }
 
-    async fn send_msg(&self, msg: Message, destination: BusName<'_>) -> Result<()> {
-        trace!(
-            "Forwarding message: {:?}, destination: {}",
-            msg,
-            destination
-        );
-        match destination {
-            BusName::Unique(dest) => self.send_msg_to_unique_name(msg, dest.clone()).await,
-            BusName::WellKnown(name) => {
-                let dest = match self.name_registry().await.lookup(name.clone()) {
-                    Some(dest) => dest,
-                    None => bail!("unknown destination: {}", name),
-                };
-                self.send_msg_to_unique_name(msg, (&*dest).into()).await
+    /// Forward `msgs`, which a peer sent in this order, to their recipients.
+    ///
+    /// Each recipient gets those of `msgs` that go to it in one go, in order, and all of them get
+    /// theirs at once.
+    async fn forward(&self, msgs: &[Message]) -> Result<()> {
+        let sends = {
+            let name_registry = self.name_registry().await;
+            let peers = self.peers.read().await;
+            let monitors = self.monitors.read().await;
+            let mut outbox = Outbox::new(msgs);
+            for (i, msg) in msgs.iter().enumerate() {
+                if msg.message_type() == message::Type::Signal {
+                    trace!("Broadcasting message: {:?}", msg);
+                    for (name, peer) in peers.iter() {
+                        if !peer.interested(msg, &name_registry) {
+                            trace!("Peer {} not interested in {msg:?}", name);
+                            continue;
+                        }
+
+                        outbox.add(name, peer.recipient(), i);
+                    }
+                } else {
+                    let header = msg.header();
+                    // peer::Stream ensures a valid destination so this isn't exactly needed.
+                    let Some(destination) = header.destination() else {
+                        bail!("invalid message: {:?}", msg);
+                    };
+                    trace!(
+                        "Forwarding message: {:?}, destination: {}",
+                        msg,
+                        destination
+                    );
+                    let peer = match destination {
+                        BusName::Unique(name) => peers.get_key_value(name.as_str()),
+                        BusName::WellKnown(name) => match name_registry.lookup(name.clone()) {
+                            Some(owner) => peers.get_key_value(owner.as_str()),
+                            None => {
+                                warn!("unknown destination: {}", name);
+
+                                continue;
+                            }
+                        },
+                    };
+                    match peer {
+                        Some((name, peer)) => outbox.add(name, peer.recipient(), i),
+                        None => debug!("no peer for destination `{destination}`"),
+                    }
+                }
+                if monitors.is_empty() {
+                    continue;
+                }
+                trace!(
+                    "Broadcasting message to {} monitors: {:?}",
+                    monitors.len(),
+                    msg
+                );
+                for (name, monitor) in monitors.iter() {
+                    if !monitor.interested(msg, &name_registry) {
+                        trace!("Monitor {} not interested in {msg:?}", name);
+                        continue;
+                    }
+
+                    outbox.add(name, monitor.recipient(), i);
+                }
+            }
+
+            outbox.into_sends()
+        };
+
+        match &sends[..] {
+            [] => (),
+            [(recipient, share)] => recipient.send(share.of(msgs)).await,
+            sends => {
+                let sends = sends
+                    .iter()
+                    .map(|(recipient, share)| recipient.send(share.of(msgs)));
+                join_all(sends).await;
             }
         }
 
         Ok(())
-    }
-
-    async fn send_msg_to_unique_name(&self, msg: Message, destination: UniqueName<'_>) {
-        let mut recipients = Vec::new();
-        match self.peers.read().await.get(destination.as_str()) {
-            Some(peer) => recipients.push(peer.recipient().clone()),
-            None => debug!("no peer for destination `{destination}`"),
-        }
-        {
-            let name_registry = self.name_registry().await;
-            self.add_monitors(&msg, &name_registry, &mut recipients)
-                .await;
-        }
-
-        send_to_all(&msg, &recipients).await;
-    }
-
-    async fn broadcast_msg(&self, msg: Message) {
-        trace!("Broadcasting message: {:?}", msg);
-        let mut recipients = Vec::new();
-        {
-            let name_registry = self.name_registry().await;
-            for peer in self.peers.read().await.values() {
-                if !peer.interested(&msg, &name_registry) {
-                    trace!("Peer {} not interested in {msg:?}", peer.unique_name());
-                    continue;
-                }
-
-                recipients.push(peer.recipient().clone());
-            }
-
-            self.add_monitors(&msg, &name_registry, &mut recipients)
-                .await;
-        }
-
-        send_to_all(&msg, &recipients).await;
-    }
-
-    /// Add the monitors that `msg` goes to, to `recipients`.
-    async fn add_monitors(
-        &self,
-        msg: &Message,
-        name_registry: &NameRegistry,
-        recipients: &mut Vec<Recipient>,
-    ) {
-        let monitors = self.monitors.read().await;
-        if monitors.is_empty() {
-            return;
-        }
-        trace!(
-            "Broadcasting message to {} monitors: {:?}",
-            monitors.len(),
-            msg
-        );
-        for monitor in monitors.values() {
-            if !monitor.interested(msg, name_registry) {
-                trace!(
-                    "Monitor {} not interested in {msg:?}",
-                    monitor.unique_name()
-                );
-                continue;
-            }
-
-            recipients.push(monitor.recipient().clone());
-        }
     }
 
     fn bus_conn(&self) -> MutexGuard<'_, Option<Connection>> {
@@ -383,13 +405,100 @@ impl Peers {
     }
 }
 
-/// Send `msg` to all of `recipients` at once.
-async fn send_to_all(msg: &Message, recipients: &[Recipient]) {
-    match recipients {
-        [] => (),
-        [recipient] => recipient.send(msg).await,
-        recipients => {
-            join_all(recipients.iter().map(|recipient| recipient.send(msg))).await;
+/// How many messages of a peer the bus forwards in one batch, at most.
+pub const MAX_BATCH: usize = 16;
+
+/// How many bytes of messages of a peer the bus forwards in one batch, unless its last message
+/// takes it past that.
+///
+/// A batch ends with the message that brings it to this or more, so that, within the time limit
+/// of a recipient, [`SEND_TIMEOUT`](crate::peer::SEND_TIMEOUT), the recipient has to take less than
+/// 64 KiB more of a batch than of its last message alone.
+pub const MAX_BATCH_BYTES: usize = 64 * 1024;
+
+/// The messages of a batch that each recipient gets.
+struct Outbox<'n, 'm> {
+    /// The messages of the batch, in the order that their sender sent them.
+    batch: &'m [Message],
+    /// Each recipient, by its unique name, and its share, in the order of their first messages.
+    sends: Vec<(&'n OwnedUniqueName, Recipient, Share)>,
+    /// Where each recipient is in `sends`, by its unique name.
+    ///
+    /// The recipients of the first message come up once each, so that they need no lookup, and
+    /// they only go in here once the recipients of another message are looked up among them. A
+    /// batch of one message, as most are when a peer waits for each reply, needs none at all.
+    index: HashMap<&'n OwnedUniqueName, usize>,
+}
+
+impl<'n, 'm> Outbox<'n, 'm> {
+    /// An outbox for the messages of `batch`.
+    fn new(batch: &'m [Message]) -> Self {
+        Self {
+            batch,
+            sends: Vec::new(),
+            index: HashMap::new(),
+        }
+    }
+
+    /// Add the message at `i` in the batch to the share of `recipient`, whose unique name is
+    /// `name`.
+    fn add(&mut self, name: &'n OwnedUniqueName, recipient: &Recipient, i: usize) {
+        if i > 0 {
+            for (at, (name, ..)) in self.sends.iter().enumerate().skip(self.index.len()) {
+                self.index.insert(name, at);
+            }
+            match self.index.entry(name) {
+                Entry::Occupied(at) => {
+                    self.sends[*at.get()].2.add(self.batch, i);
+
+                    return;
+                }
+                Entry::Vacant(at) => {
+                    at.insert(self.sends.len());
+                }
+            }
+        }
+
+        self.sends
+            .push((name, recipient.clone(), Share::Run(i..i + 1)));
+    }
+
+    /// Each recipient and its share, in the order of their first messages.
+    fn into_sends(self) -> Vec<(Recipient, Share)> {
+        self.sends
+            .into_iter()
+            .map(|(_, recipient, share)| (recipient, share))
+            .collect()
+    }
+}
+
+/// The messages of a batch that a recipient gets.
+enum Share {
+    /// The messages in this range of the batch, one after the other, as most shares are.
+    Run(Range<usize>),
+    /// Messages that aren't all next to each other in the batch.
+    Picked(Vec<Message>),
+}
+
+impl Share {
+    /// Add the message at `i` in `batch`, which comes after those in the share.
+    fn add(&mut self, batch: &[Message], i: usize) {
+        match self {
+            Self::Run(run) if run.end == i => run.end += 1,
+            Self::Run(run) => {
+                let mut picked = batch[run.clone()].to_vec();
+                picked.push(batch[i].clone());
+                *self = Self::Picked(picked);
+            }
+            Self::Picked(picked) => picked.push(batch[i].clone()),
+        }
+    }
+
+    /// The messages of the share, out of `batch`.
+    fn of<'s>(&'s self, batch: &'s [Message]) -> &'s [Message] {
+        match self {
+            Self::Run(run) => &batch[run.clone()],
+            Self::Picked(picked) => picked,
         }
     }
 }
