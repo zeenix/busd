@@ -17,7 +17,7 @@ use std::{
 use anyhow::{ensure, Context};
 use busd::bus::Bus;
 use futures_util::{
-    future::{select, try_join_all, Either},
+    future::{join, select, try_join_all, Either},
     stream::StreamExt,
 };
 use ntest::timeout;
@@ -511,22 +511,31 @@ async fn stalled_subscribers_(address: String) -> anyhow::Result<()> {
 
     let flooder = connect(&address).await?;
     let started = Instant::now();
-    flood(&flooder, FLOOD_SIGNALS).await?;
-
-    // The bus disconnects the stalled clients once it has waited on them for the time limit, which
-    // it does for all of them at once.
-    while !left.is_empty() {
-        let (changed, old_owner, new_owner) = next_owner_change(&mut changes).await?;
-        if old_owner == changed && new_owner.is_empty() {
-            left.retain(|name| *name != changed);
+    // The bus disconnects the stalled clients once it has waited on them for the time limit. They
+    // are timed as they go, while the rest of the flood still goes through the bus, which takes a
+    // while longer.
+    let gone = async {
+        while !left.is_empty() {
+            let (changed, old_owner, new_owner) = next_owner_change(&mut changes).await?;
+            if old_owner == changed && new_owner.is_empty() {
+                left.retain(|name| *name != changed);
+            }
         }
-    }
-    let waited = started.elapsed();
+
+        anyhow::Ok(started.elapsed())
+    };
+    let (waited, flooded) = join(gone, flood(&flooder, FLOOD_SIGNALS)).await;
+    flooded?;
+    let waited = waited?;
     ensure!(
         waited >= SHORT_TIMEOUT,
         "the stalled clients went after {waited:?}"
     );
-    // Waiting on them in turn would take the time limit as many times as there are of them.
+    // The bus waits at once on those that stop taking the flood at the same signal, while waiting
+    // on them in turn would take the time limit as many times as there are of them. The sockets of
+    // those that connected first hold a few more of the bus's signals from before the flood, about
+    // the clients after them, so they can stop taking it a signal or so sooner than the others,
+    // which the bus then waits on for a time limit of their own.
     let in_turn = SHORT_TIMEOUT * STALLED_SUBSCRIBERS as u32;
     ensure!(
         waited < in_turn - SHORT_TIMEOUT,
