@@ -17,7 +17,7 @@ use std::{
 use anyhow::{ensure, Context};
 use busd::bus::Bus;
 use futures_util::{
-    future::{select, try_join_all, Either},
+    future::{join, select, try_join_all, Either},
     stream::StreamExt,
 };
 use ntest::timeout;
@@ -159,6 +159,17 @@ fn client_without_fds() {
     init_tracing();
 
     zruntime::block_on(with_bus(LONG_TIMEOUT, client_without_fds_));
+}
+
+/// Messages that a client can't take, as they have file descriptors and the client didn't
+/// negotiate passing them, don't hold up those that the bus sends the client along with them.
+#[test]
+#[instrument]
+#[timeout(30000)]
+fn client_without_fds_in_a_batch() {
+    init_tracing();
+
+    zruntime::block_on(with_bus(LONG_TIMEOUT, client_without_fds_in_a_batch_));
 }
 
 /// A client that the bus can't write to anymore gets disconnected, even while the bus can still
@@ -500,22 +511,31 @@ async fn stalled_subscribers_(address: String) -> anyhow::Result<()> {
 
     let flooder = connect(&address).await?;
     let started = Instant::now();
-    flood(&flooder, FLOOD_SIGNALS).await?;
-
-    // The bus disconnects the stalled clients once it has waited on them for the time limit, which
-    // it does for all of them at once.
-    while !left.is_empty() {
-        let (changed, old_owner, new_owner) = next_owner_change(&mut changes).await?;
-        if old_owner == changed && new_owner.is_empty() {
-            left.retain(|name| *name != changed);
+    // The bus disconnects the stalled clients once it has waited on them for the time limit. They
+    // are timed as they go, while the rest of the flood still goes through the bus, which takes a
+    // while longer.
+    let gone = async {
+        while !left.is_empty() {
+            let (changed, old_owner, new_owner) = next_owner_change(&mut changes).await?;
+            if old_owner == changed && new_owner.is_empty() {
+                left.retain(|name| *name != changed);
+            }
         }
-    }
-    let waited = started.elapsed();
+
+        anyhow::Ok(started.elapsed())
+    };
+    let (waited, flooded) = join(gone, flood(&flooder, FLOOD_SIGNALS)).await;
+    flooded?;
+    let waited = waited?;
     ensure!(
         waited >= SHORT_TIMEOUT,
         "the stalled clients went after {waited:?}"
     );
-    // Waiting on them in turn would take the time limit as many times as there are of them.
+    // The bus waits at once on those that stop taking the flood at the same signal, while waiting
+    // on them in turn would take the time limit as many times as there are of them. The sockets of
+    // those that connected first hold a few more of the bus's signals from before the flood, about
+    // the clients after them, so they can stop taking it a signal or so sooner than the others,
+    // which the bus then waits on for a time limit of their own.
     let in_turn = SHORT_TIMEOUT * STALLED_SUBSCRIBERS as u32;
     ensure!(
         waited < in_turn - SHORT_TIMEOUT,
@@ -668,6 +688,42 @@ async fn client_without_fds_(address: String) -> anyhow::Result<()> {
 
     // The reply to a call of the client comes after the signal, and still gets to it.
     DBusProxy::new(&client).await?.get_id().await?;
+
+    Ok(())
+}
+
+async fn client_without_fds_in_a_batch_(address: String) -> anyhow::Result<()> {
+    let (client, _) = client_on_socket(&address).await?;
+    let client_name = client.unique_name().unwrap().to_owned();
+    let rule = MatchRule::builder()
+        .msg_type(message::Type::Signal)
+        .interface("org.zbus.Fds")
+        .build()?;
+    let mut signals = MessageStream::for_match_rule(rule, &client, None).await?;
+
+    // Signals for the client, one with a file descriptor between two without, which the sender
+    // sends at once, for the bus to forward them together.
+    let sender = connect(&address).await?;
+    let file = File::open("/dev/null")?;
+    let signal =
+        |member| Message::signal("/org/zbus/Fds", "org.zbus.Fds", member).destination(&client_name);
+    let msgs = [
+        signal("Before").build(&())?,
+        signal("WithFd").build(&Fd::from(&file))?,
+        signal("After").build(&())?,
+    ];
+    sender.send_all(&msgs).await?;
+
+    // The client gets the two without.
+    for expected in ["Before", "After"] {
+        let msg = signals.next().await.context("the stream ended")??;
+        let header = msg.header();
+        let member = header.member().map(|member| member.as_str());
+        ensure!(
+            member == Some(expected),
+            "got {member:?} rather than `{expected}`"
+        );
+    }
 
     Ok(())
 }

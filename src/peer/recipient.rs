@@ -15,19 +15,19 @@ use crate::{debug, warn};
 
 /// Where the bus sends the messages for a peer, or a monitor.
 ///
-/// It is cheap to clone, so that the bus can pick the recipients of a message while it holds its
-/// locks, and send the message to them once it has let go of those. The clones share the state of
+/// It is cheap to clone, so that the bus can pick the recipients of messages while it holds its
+/// locks, and send the messages to them once it has let go of those. The clones share the state of
 /// the peer's connection, which a peer hands on to the monitor that it becomes.
 ///
-/// The bus keeps no queue of messages for a client: it writes each message to the client's socket
-/// as it forwards it, and waits for room there if need be. A client that keeps a message waiting
-/// for longer than its time limit, [`SEND_TIMEOUT`] by default, gets disconnected. So what is
-/// limited is how long a client that doesn't read holds up the messages for it, rather than how
-/// many bytes of them may pile up for it, as with the quotas of dbus-broker. dbus-broker
-/// disconnects a client that can't take a reply or a signal that it expects, as the bus does, but
-/// it rejects a method call that the callee can't take, with `LimitsExceeded`, and keeps the
-/// callee. The bus disconnects the callee then too, as a send that times out may leave part of its
-/// message on the socket.
+/// The bus keeps no queue of messages for a client: it writes the messages to the client's socket
+/// as it forwards them, those that it forwards to the client together in one go, and waits for
+/// room there if need be. A client that keeps messages waiting for longer than its time limit,
+/// [`SEND_TIMEOUT`] by default, gets disconnected. So what is limited is how long a client that
+/// doesn't read holds up the messages for it, rather than how many bytes of them may pile up for
+/// it, as with the quotas of dbus-broker. dbus-broker disconnects a client that can't take a reply
+/// or a signal that it expects, as the bus does, but it rejects a method call that the callee can't
+/// take, with `LimitsExceeded`, and keeps the callee. The bus disconnects the callee then too, as a
+/// send that times out may leave part of a message on the socket.
 #[derive(Debug, Clone)]
 pub struct Recipient(Kind);
 
@@ -60,40 +60,45 @@ impl Recipient {
         Self(Kind::Bus(conn))
     }
 
-    /// Send `msg`.
+    /// Send `msgs`, in order, in one go: with as few writes as the socket takes.
     ///
-    /// A client that a send to fails, or doesn't take the message within its time limit, gets
-    /// disconnected: the end of its connection has the bus remove it, along with its names. A
-    /// message with file descriptors, for a client that didn't negotiate passing them, is dropped
-    /// instead, as the client can still take the messages after it.
-    pub async fn send(&self, msg: &Message) {
+    /// A client that a send to fails, or doesn't take the messages within its time limit, gets
+    /// disconnected: the end of its connection has the bus remove it, along with its names. The
+    /// messages with file descriptors, for a client that didn't negotiate passing them, are dropped
+    /// instead, as the client can still take the others.
+    pub async fn send(&self, msgs: &[Message]) {
         match &self.0 {
-            Kind::Client(client) => client.send(msg).await,
+            Kind::Client(client) => client.send(msgs).await,
             Kind::Bus(conn) => {
-                if let Err(e) = conn.send(msg).await {
-                    warn!("Error sending message to the bus: {}", e);
+                if let Err(e) = conn.send_all(msgs).await {
+                    warn!("Error sending messages to the bus: {}", e);
                 }
             }
         }
     }
 }
 
-/// How long the bus waits for a client to take a message, by default, before it disconnects the
-/// client.
+/// How long the bus waits for a client to take the messages that it sends it in one go, by
+/// default, before it disconnects the client.
 ///
-/// The wait counts from when the bus starts to send the message, so it covers the wait for the
-/// other messages on their way to the client, as well as the write of this one.
+/// The wait counts from when the bus starts to send the messages, so it covers the wait for the
+/// other messages on their way to the client, as well as the write of these. The bus forwards the
+/// messages of each sender in batches, of up to [`MAX_BATCH`] messages and [`MAX_BATCH_BYTES`]
+/// bytes but for the last message, and sends a client in one go those of a batch that go to it.
 ///
-/// The bus forwards the messages of each sender one after the other, so a client that stops
-/// reading while it is subscribed to the signals of the bus holds up every message of the bus, its
-/// replies included, for this long before it gets disconnected. Several such clients that stop
-/// taking messages at the same one hold it up for this long all together, as the bus sends a
-/// message to all of its recipients at once. That is why this is short: a holdup of 100 ms is
-/// barely noticeable, and nothing next to the 25 s that a method call waits for its reply by
-/// default, with libdbus, GDBus and sd-bus. The cost is that a client has to keep up with what it
-/// gets: one that reads at 128 MiB/s takes messages of up to 12.8 MiB in this time, but the
-/// largest messages, of 128 MiB, take reading at 1.25 GiB/s, and a client that gets stuck for
-/// longer than this, with a message waiting for it that its socket can't take, gets disconnected.
+/// The bus forwards the batches of each sender one after the other, so a client that stops reading
+/// while it is subscribed to the signals of the bus holds up every message of the bus, its replies
+/// included, for this long before it gets disconnected. Several such clients that stop taking
+/// messages at the same batch hold it up for this long all together, as the bus sends a batch to
+/// all of its recipients at once. That is why this is short: a holdup of 100 ms is barely
+/// noticeable, and nothing next to the 25 s that a method call waits for its reply by default,
+/// with libdbus, GDBus and sd-bus. The cost is that a client has to keep up with what it gets: one
+/// that reads at 128 MiB/s takes up to 12.8 MiB of messages in this time, but the largest messages,
+/// of 128 MiB, take reading at 1.25 GiB/s, and a client that gets stuck for longer than this, with
+/// messages waiting for it that its socket can't take, gets disconnected.
+///
+/// [`MAX_BATCH`]: crate::peers::MAX_BATCH
+/// [`MAX_BATCH_BYTES`]: crate::peers::MAX_BATCH_BYTES
 pub const SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
@@ -121,24 +126,14 @@ struct Client {
 }
 
 impl Client {
-    async fn send(&self, msg: &Message) {
+    async fn send(&self, msgs: &[Message]) {
         if self.disconnecting.load(Ordering::SeqCst) {
             return;
         }
         let (failure, first) = {
-            let send = pin!(self.runtime.timeout(self.timeout, self.send_in_turn(msg)));
+            let send = pin!(self.runtime.timeout(self.timeout, self.send_in_turn(msgs)));
             let failure = match send.await {
                 Ok(Ok(())) => return,
-                // The message has file descriptors, and the client didn't negotiate passing
-                // them. zbus finds that before it writes anything.
-                Ok(Err(zbus::Error::Unsupported)) => {
-                    debug!(
-                        "Dropping a message with file descriptors for `{}`, which takes none",
-                        self.unique_name
-                    );
-
-                    return;
-                }
                 Ok(Err(e)) => Failure::Error(e),
                 Err(_) => Failure::Timeout,
             };
@@ -155,11 +150,13 @@ impl Client {
         }
         match failure {
             Failure::Timeout => warn!(
-                "Disconnecting `{}`, as it didn't take a message within {:?}",
-                self.unique_name, self.timeout
+                "Disconnecting `{}`, as it didn't take {} messages within {:?}",
+                self.unique_name,
+                msgs.len(),
+                self.timeout
             ),
             Failure::Error(e) => debug!(
-                "Disconnecting `{}`, as sending a message to it failed: {e}",
+                "Disconnecting `{}`, as sending messages to it failed: {e}",
                 self.unique_name
             ),
         }
@@ -174,15 +171,35 @@ impl Client {
         }
     }
 
-    /// Send `msg` once no other send to the client is under way, unless the client is being
+    /// Send `msgs` once no other send to the client is under way, unless the client is being
     /// disconnected by then.
-    async fn send_in_turn(&self, msg: &Message) -> zbus::Result<()> {
+    async fn send_in_turn(&self, msgs: &[Message]) -> zbus::Result<()> {
         let _turn = self.sending.lock().await;
         if self.disconnecting.load(Ordering::SeqCst) {
             return Ok(());
         }
 
-        self.conn.send(msg).await
+        match self.conn.send_all(msgs).await {
+            // Some of the messages have file descriptors, and the client didn't negotiate passing
+            // them. zbus finds that before it writes anything, so the others can still go.
+            Err(zbus::Error::Unsupported) => {
+                let without_fds: Vec<_> = msgs
+                    .iter()
+                    .filter(|msg| msg.data().fds().is_empty())
+                    .cloned()
+                    .collect();
+                debug!(
+                    "Dropping {} of {} messages for `{}`, which have file descriptors that it \
+                     takes none of",
+                    msgs.len() - without_fds.len(),
+                    msgs.len(),
+                    self.unique_name
+                );
+
+                self.conn.send_all(&without_fds).await
+            }
+            result => result,
+        }
     }
 }
 
