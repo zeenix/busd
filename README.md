@@ -14,21 +14,30 @@ Alpha. It's not ready for production use yet. Only the essentials are in place.
 
 ## Performance
 
-busd is close behind [dbus-broker], the broker that most systems run, while it needs less memory,
-and well ahead of [dbus-daemon]. Measured with [dbus-bench] on a laptop with an AMD Ryzen 7 7840U,
-running Fedora 44, as the median of 15 runs:
+busd broadcasts signals faster than [dbus-broker], the broker that most systems run, is close behind
+it on method calls, needs less memory than it, and is well ahead of [dbus-daemon]. Measured with
+[dbus-bench] on a laptop with an AMD Ryzen 7 7840U, running Fedora 44, as the medians of 60 runs:
 
 | Broker             | 1 client | 20 clients | CPU time with 20 clients | Peak memory |
 |--------------------|---------:|-----------:|-------------------------:|------------:|
-| busd               |  0.070 s |    0.475 s |                   0.37 s |     6.4 MiB |
-| dbus-broker 37     |  0.062 s |    0.451 s |                   0.31 s |     8.1 MiB |
-| dbus-daemon 1.16.2 |  0.142 s |    1.195 s |                   1.17 s |     6.1 MiB |
+| busd               |  0.071 s |    0.443 s |                   0.35 s |     6.6 MiB |
+| dbus-broker 37     |  0.060 s |    0.427 s |                   0.28 s |     8.0 MiB |
+| dbus-daemon 1.16.2 |  0.134 s |    1.143 s |                   1.12 s |     6.1 MiB |
 
 Each client makes 1000 method calls with 16 KiB of data each, and the 20 clients make theirs all
 at once. With 20 clients, the benchmark's client keeps its own CPU busy with busd and dbus-broker
-alike, so the CPU time that the broker needs is what tells those two apart. The memory of
-dbus-broker is that of its two processes, its launcher and the broker proper, together. The
-[results] in dbus-bench have the details, and how busd fares on other machines.
+alike, so the CPU time that the broker needs is what tells those two apart.
+
+| Broker             | Burst to 1 subscriber | Broadcast to 20 | CPU time of the broadcast | Peak memory |
+|--------------------|----------------------:|----------------:|--------------------------:|------------:|
+| busd               |               0.216 s |         0.138 s |                    0.11 s |     6.2 MiB |
+| dbus-broker 37     |               0.188 s |         0.219 s |                    0.19 s |    14.6 MiB |
+| dbus-daemon 1.16.2 |               0.847 s |         2.006 s |                    1.98 s |     5.5 MiB |
+
+The burst is 40,000 signals with 1 KiB of data each, to one subscriber, and the broadcast 6000 of
+them to each of 20 subscribers: busd writes several of them to a subscriber with each system call.
+The memory of dbus-broker is that of its two processes, its launcher and the broker proper,
+together. The [results] in dbus-bench have the details, and how busd fares on other machines.
 
 ## Installation & Use
 
