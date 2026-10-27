@@ -50,6 +50,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fastrand",
+ "foldhash",
  "futures-util",
  "ntest",
  "quick-xml",
