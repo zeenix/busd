@@ -41,10 +41,15 @@ impl Peer {
         // task is spawned, so that messages the client pipelines right after authentication
         // (notably `Hello`) are never dropped in the race window between `build()` and stream
         // creation. See https://github.com/z-galaxy/zbus/pull/1760.
+        //
+        // zbus checks the body of each message of the client as it receives it, as the bus passes
+        // the bodies of messages on without deserializing them, and the connection ends on one
+        // that doesn't hold what its signature says, as with dbus-broker.
         let msg_stream = builder
             .server(guid)
             .p2p()
             .auth_mechanism(auth_mechanism)
+            .validate_bodies()
             .build_message_stream()
             .await?;
         let conn = Connection::from(&msg_stream);
