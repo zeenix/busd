@@ -83,15 +83,20 @@ strip = "symbols"
 debug = "full"
 
 # The time limit on each send to a client reads the clock only once the send has to wait, as of
-# z-galaxy/zruntime#58, which no release of zruntime has yet. Patching crates.io's zruntime, rather
-# than depending on it from git, has zbus build on it too: busd and zbus must share one runtime.
+# z-galaxy/zruntime#58, and the socket of a client that a wait found readable stays watched until
+# the task that the wait woke has run, rather than being let go of and watched again for each
+# message where many clients are busy, as of z-galaxy/zruntime#60. No release of zruntime has
+# either yet. Patching crates.io's zruntime, rather than depending on it from git, has zbus build on
+# it too: busd and zbus must share one runtime.
 [patch.crates-io.zruntime]
 git = "https://github.com/z-galaxy/zruntime"
-rev = "99e2ebd807723177bec5d7c5216e48448c3a91c9"
+rev = "b3bd01d8fc1827c690d2525a157694afd030ea4b"
 
-# The bus writes the messages that it forwards to a client in one go, with `Connection::send_all`,
-# which zbus's main branch has, but no release of zbus yet. Patching crates.io's zbus, rather than
+# The bus writes the messages that it forwards to a client in one go, with `Connection::send_all`
+# (z-galaxy/zbus#2079), and decodes the header of each message that it receives in one pass
+# (z-galaxy/zbus#2081), with a cheaper parse of the signature of its body (z-galaxy/zbus#2083).
+# zbus's main branch has these, but no release of zbus yet. Patching crates.io's zbus, rather than
 # depending on it from git, has the tests, which depend on zbus too, build on it as well.
 [patch.crates-io.zbus]
 git = "https://github.com/z-galaxy/zbus"
-rev = "73504bac27117d8e16f089da7b83b28fd19b268c"
+rev = "50c54bfdc2b1fbb66d555d41a0cfb3063c014566"
