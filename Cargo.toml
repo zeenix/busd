@@ -96,7 +96,8 @@ rev = "b3bd01d8fc1827c690d2525a157694afd030ea4b"
 # The bus writes the messages that it forwards to a client in one go, with `Connection::send_all`
 # (z-galaxy/zbus#2079), and decodes the header of each message that it receives in one pass
 # (z-galaxy/zbus#2081), with a cheaper parse of the signature of its body (z-galaxy/zbus#2083), and
-# has zbus check the body of each message of its clients as it receives it (z-galaxy/zbus#2086).
+# has zbus check the body of each message of its clients as it receives it, and sets the sender of
+# a message with `Message::with_sender` (z-galaxy/zbus#2086).
 # zbus's main branch has these, but no release of zbus yet. Patching crates.io's zbus, rather than
 # depending on it from git, has the tests, which depend on zbus too, build on it as well.
 [patch.crates-io.zbus]
