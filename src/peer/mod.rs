@@ -5,10 +5,12 @@ mod monitor;
 pub use monitor::*;
 mod recipient;
 pub use recipient::*;
+mod pending_calls;
+pub use pending_calls::*;
 
 use crate::trace;
 use anyhow::Result;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use zbus::{
     connection::{self, AuthMechanism},
     names::{BusName, OwnedUniqueName},
@@ -22,8 +24,11 @@ use crate::{fdo, match_rules::MatchRules, name_registry::NameRegistry};
 pub struct Peer {
     conn: Connection,
     recipient: Recipient,
+    id: usize,
     unique_name: OwnedUniqueName,
     match_rules: MatchRules,
+    /// The calls to the peer that wait for its reply.
+    pending_calls: Arc<PendingCalls>,
     greeted: bool,
     canceled_event: Event,
 }
@@ -36,15 +41,21 @@ impl Peer {
         auth_mechanism: AuthMechanism,
         send_timeout: Duration,
     ) -> Result<(Self, Stream)> {
+        debug_assert_ne!(id, BUS_ID, "a client numbered as the bus");
         let unique_name = OwnedUniqueName::try_from(format!(":busd.{id}")).unwrap();
         // Use `build_message_stream` to activate a message receiver before the socket reader
         // task is spawned, so that messages the client pipelines right after authentication
         // (notably `Hello`) are never dropped in the race window between `build()` and stream
         // creation. See https://github.com/z-galaxy/zbus/pull/1760.
+        //
+        // zbus checks the body of each message of the client as it receives it, as the bus passes
+        // the bodies of messages on without deserializing them, and the connection ends on one
+        // that doesn't hold what its signature says, as with dbus-broker.
         let msg_stream = builder
             .server(guid)
             .p2p()
             .auth_mechanism(auth_mechanism)
+            .validate_bodies()
             .build_message_stream()
             .await?;
         let conn = Connection::from(&msg_stream);
@@ -53,8 +64,10 @@ impl Peer {
         let peer = Self {
             recipient: Recipient::client(conn.clone(), unique_name.clone(), send_timeout)?,
             conn,
+            id,
             unique_name,
             match_rules: MatchRules::default(),
+            pending_calls: Arc::default(),
             greeted: false,
             canceled_event: Event::new(),
         };
@@ -70,8 +83,10 @@ impl Peer {
         let peer = Self {
             recipient: Recipient::bus(conn.clone()),
             conn,
+            id: BUS_ID,
             unique_name,
             match_rules: MatchRules::default(),
+            pending_calls: Arc::default(),
             greeted: true,
             canceled_event: Event::new(),
         };
@@ -83,6 +98,12 @@ impl Peer {
         &self.unique_name
     }
 
+    /// The number of the peer, which no other peer that the bus ever has shares: 0 for the bus
+    /// itself, and from 1 on for clients, whose unique names carry it.
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -90,6 +111,11 @@ impl Peer {
     /// Where the bus sends the messages for the peer.
     pub fn recipient(&self) -> &Recipient {
         &self.recipient
+    }
+
+    /// The calls to the peer that wait for its reply.
+    pub fn pending_calls(&self) -> &Arc<PendingCalls> {
+        &self.pending_calls
     }
 
     pub fn listen_cancellation(&self) -> EventListener {
@@ -145,6 +171,9 @@ impl Drop for Peer {
         self.canceled_event.notify(usize::MAX);
     }
 }
+
+/// The number of the bus, as a peer of its own.
+const BUS_ID: usize = 0;
 
 /// How many file descriptors a message may carry: as many as Linux passes in one write
 /// (`SCM_MAX_FD`), which is how zbus passes those of a message.

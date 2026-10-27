@@ -7,6 +7,7 @@ use futures_util::{
 use std::{
     collections::{hash_map::Entry, BTreeMap, HashMap},
     future::poll_fn,
+    num::NonZeroU32,
     ops::{Deref, DerefMut, Range},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     task::Poll,
@@ -24,7 +25,7 @@ use crate::{
     fdo,
     match_rules::MatchRules,
     name_registry::{NameOwnerChanged, NameRegistry},
-    peer::{Monitor, Peer, Recipient, Stream, MAX_MESSAGE_FDS},
+    peer::{Monitor, Peer, PendingCalls, Recipient, Stream, MAX_MESSAGE_FDS},
 };
 
 /// The peers of the bus, and its monitors and names.
@@ -78,6 +79,8 @@ impl Peers {
             Peer::new(guid.clone(), id, builder, auth_mechanism, send_timeout).await?;
         let unique_name = peer.unique_name().clone();
         let listener = peer.listen_cancellation();
+        let pending_calls = peer.pending_calls().clone();
+        let id = peer.id();
 
         let mut peers = self.peers_mut().await;
         match peers.get(&unique_name) {
@@ -86,10 +89,13 @@ impl Peers {
                 peer.unique_name()
             ),
             None => {
-                spawn(
-                    self.clone()
-                        .serve_peer(peer_stream, listener, unique_name.clone()),
-                )
+                spawn(self.clone().serve_peer(
+                    peer_stream,
+                    listener,
+                    unique_name.clone(),
+                    id,
+                    pending_calls,
+                ))
                 .detach();
                 peers.insert(unique_name.clone(), peer);
             }
@@ -105,6 +111,8 @@ impl Peers {
         let (peer, peer_stream) = Peer::new_us(msg_stream).await;
         let unique_name = peer.unique_name().clone();
         let listener = peer.listen_cancellation();
+        let pending_calls = peer.pending_calls().clone();
+        let id = peer.id();
 
         let mut peers = self.peers_mut().await;
         match peers.get(&unique_name) {
@@ -113,10 +121,13 @@ impl Peers {
                 peer.unique_name()
             ),
             None => {
-                spawn(
-                    self.clone()
-                        .serve_peer(peer_stream, listener, unique_name.clone()),
-                )
+                spawn(self.clone().serve_peer(
+                    peer_stream,
+                    listener,
+                    unique_name.clone(),
+                    id,
+                    pending_calls,
+                ))
                 .detach();
                 peers.insert(unique_name.clone(), peer);
             }
@@ -222,11 +233,15 @@ impl Peers {
         Ok(())
     }
 
+    /// Serve the peer `unique_name`, numbered `id`, whose messages come out of `peer_stream`, and
+    /// whose calls that wait for its replies are `pending_calls`, until it goes.
     async fn serve_peer(
         self: Arc<Self>,
         mut peer_stream: Stream,
         mut cancellation_listener: EventListener,
         unique_name: OwnedUniqueName,
+        id: usize,
+        pending_calls: Arc<PendingCalls>,
     ) -> Result<()> {
         let mut batch = Vec::new();
         loop {
@@ -274,7 +289,8 @@ impl Peers {
                 }
             }
 
-            self.forward(&batch).await?;
+            self.forward(&unique_name, id, &pending_calls, &batch)
+                .await?;
             batch.clear();
             if too_many_fds {
                 warn!(
@@ -294,33 +310,61 @@ impl Peers {
         // Stream is done means the peer disconnected or it became a monitor, unless the peer sent
         // a message that gets it disconnected. Remove it from the list of peers: that, and the end
         // of its stream, close its connection.
-        if self.peers_mut().await.remove(&unique_name).is_none() {
-            // This means peer was turned into a monitor. `Monitoring` iface will emit the signals.
-            return Ok(());
+        let removed = self.peers_mut().await.remove(&unique_name).is_some();
+        // The calls that the peer made won't get their replies to it now.
+        for peer in self.peers().await.values() {
+            peer.pending_calls().forget(id);
         }
-        let names_changes = self
-            .name_registry_mut()
-            .await
-            .release_all(unique_name.inner().clone())
-            .await;
-        for changed in names_changes {
-            self.notify_name_changes(changed).await?;
+        // Not being in the list means the peer was turned into a monitor. `Monitoring` iface
+        // emits the signals then.
+        if removed {
+            let names_changes = self
+                .name_registry_mut()
+                .await
+                .release_all(unique_name.inner().clone())
+                .await;
+            for changed in names_changes {
+                self.notify_name_changes(changed).await?;
+            }
+            self.notify_name_changes(NameOwnerChanged {
+                name: BusName::from(unique_name.clone()).into(),
+                old_owner: Some(unique_name.clone()),
+                new_owner: None,
+            })
+            .await?;
         }
-        self.notify_name_changes(NameOwnerChanged {
-            name: BusName::from(unique_name.clone()).into(),
-            old_owner: Some(unique_name.clone()),
-            new_owner: None,
-        })
-        .await?;
+        // Nor will the calls that wait on the peer get its replies, so they get an error from the
+        // bus instead, as with dbus-broker, rather than wait for as long as their callers do.
+        for (caller, serial) in pending_calls.take() {
+            let error = no_reply(&caller, serial)?;
+            self.send_from_bus(&error).await;
+        }
 
         Ok(())
     }
 
-    /// Forward `msgs`, which a peer sent in this order, to their recipients.
+    /// Forward `msgs`, which the peer `sender`, numbered `sender_id`, sent in this order, to their
+    /// recipients.
     ///
     /// Each recipient gets those of `msgs` that go to it in one go, in order, and all of them get
     /// theirs at once.
-    async fn forward(&self, msgs: &[Message]) -> Result<()> {
+    ///
+    /// A call that expects a reply is recorded as one that waits on its callee as it goes to the
+    /// callee, unless its caller has a call of the same serial waiting there already, in which case
+    /// the bus refuses it, with an error, as dbus-broker does. A reply, or an error, of `sender`
+    /// only goes on if it answers one of the calls that wait on `sender`, `pending_calls`. The bus
+    /// answers each call to it itself, so those aren't recorded, and its own replies go on as they
+    /// are.
+    async fn forward(
+        &self,
+        sender: &OwnedUniqueName,
+        sender_id: usize,
+        pending_calls: &PendingCalls,
+        msgs: &[Message],
+    ) -> Result<()> {
+        let from_bus = *sender == fdo::BUS_NAME;
+        // The calls that the bus refuses.
+        let mut refused = Vec::new();
         let sends = {
             let name_registry = self.name_registry().await;
             let peers = self.peers.read().await;
@@ -359,8 +403,43 @@ impl Peers {
                             }
                         },
                     };
+                    let msg_type = msg.message_type();
+                    if !from_bus
+                        && matches!(msg_type, message::Type::MethodReturn | message::Type::Error)
+                    {
+                        let answers = match (peer, header.reply_serial()) {
+                            (Some((_, peer)), Some(serial)) => {
+                                pending_calls.remove(peer.id(), serial)
+                            }
+                            _ => false,
+                        };
+                        // Monitors don't get it either, as it doesn't go anywhere.
+                        if !answers {
+                            debug!(
+                                "Dropping {msg:?}, as it answers no call that waits on {sender}"
+                            );
+
+                            continue;
+                        }
+                    }
                     match peer {
-                        Some((name, peer)) => outbox.add(name, peer.recipient(), i),
+                        Some((name, peer)) => {
+                            let primary = msg.primary_header();
+                            if msg_type == message::Type::MethodCall
+                                && !primary.flags().contains(message::Flags::NO_REPLY_EXPECTED)
+                                && *name != fdo::BUS_NAME
+                                && !peer.pending_calls().add(
+                                    sender_id,
+                                    sender,
+                                    primary.serial_num(),
+                                )
+                            {
+                                refused.push(i);
+
+                                continue;
+                            }
+                            outbox.add(name, peer.recipient(), i)
+                        }
                         None => debug!("no peer for destination `{destination}`"),
                     }
                 }
@@ -395,14 +474,46 @@ impl Peers {
                 join_all(sends).await;
             }
         }
+        for i in refused {
+            let error =
+                Message::error(&msgs[i].header(), "org.freedesktop.DBus.Error.AccessDenied")
+                    .sender(fdo::BUS_NAME)
+                    .build(&"Pending reply with that serial already exists")?;
+            self.send_from_bus(&error).await;
+        }
 
         Ok(())
+    }
+
+    /// Send `msg` on the connection of the bus, as the bus, unless the bus is going.
+    async fn send_from_bus(&self, msg: &Message) {
+        let Some(bus) = self.bus_conn().clone() else {
+            return;
+        };
+        if let Err(e) = bus.send(msg).await {
+            warn!("Failed to send {msg:?} from the bus: {e}");
+        }
     }
 
     fn bus_conn(&self) -> MutexGuard<'_, Option<Connection>> {
         // Nothing can panic while the lock is held.
         self.bus_conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// The `NoReply` error, from the bus, to the call of `caller` with `serial`, as dbus-broker sends
+/// to each call that waits on a peer that goes.
+fn no_reply(caller: &OwnedUniqueName, serial: NonZeroU32) -> zbus::Result<Message> {
+    // zbus only builds an error as the reply to the header of a call, and the bus doesn't keep the
+    // calls themselves. A call of `caller` with `serial` has all that the error takes of it.
+    let call = Message::method_call(fdo::DBus::PATH, "Call")
+        .sender(caller)
+        .serial(serial)
+        .build(&())?;
+
+    Message::error(&call.header(), "org.freedesktop.DBus.Error.NoReply")
+        .sender(fdo::BUS_NAME)
+        .build(&"Remote peer disconnected")
 }
 
 /// How many messages of a peer the bus forwards in one batch, at most.

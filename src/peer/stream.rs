@@ -33,22 +33,12 @@ impl Stream {
                 }
 
                 // Ensure sender field is present. If it is not we add it using the unique name
-                // of the peer.
+                // of the peer, as most clients leave it out.
                 match header.sender() {
                     Some(sender) if *sender == unique_name => Ok(msg),
                     Some(_) => bail!("failed to parse message: Invalid sender field"),
                     None => {
-                        let signature = header.signature();
-                        let body = msg.body();
-                        let body_bytes = body.data();
-                        let fds = body_bytes
-                            .fds()
-                            .iter()
-                            .map(|fd| fd.try_clone().map(Into::into))
-                            .collect::<zbus::Result<Vec<_>>>()?;
-                        let builder = message::Builder::from(header.clone()).sender(&unique_name);
-                        let new_msg =
-                            unsafe { builder.build_raw_body(body_bytes, signature, fds)? };
+                        let new_msg = msg.with_sender(&unique_name)?;
                         trace!("Added sender field to message: {:?}", new_msg);
 
                         Ok(new_msg)
