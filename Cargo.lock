@@ -1198,7 +1198,7 @@ dependencies = [
 [[package]]
 name = "zruntime"
 version = "0.2.1"
-source = "git+https://github.com/z-galaxy/zruntime?rev=b3bd01d8fc1827c690d2525a157694afd030ea4b#b3bd01d8fc1827c690d2525a157694afd030ea4b"
+source = "git+https://github.com/z-galaxy/zruntime?rev=aae96ac214183ed6636968a7432e2313b3ea977d#aae96ac214183ed6636968a7432e2313b3ea977d"
 dependencies = [
  "errno",
  "futures-core",

@@ -86,12 +86,15 @@ debug = "full"
 # The time limit on each send to a client reads the clock only once the send has to wait, as of
 # z-galaxy/zruntime#58, and the socket of a client that a wait found readable stays watched until
 # the task that the wait woke has run, rather than being let go of and watched again for each
-# message where many clients are busy, as of z-galaxy/zruntime#60. No release of zruntime has
-# either yet. Patching crates.io's zruntime, rather than depending on it from git, has zbus build on
+# message where many clients are busy, as of z-galaxy/zruntime#60. `block_on` polls the future of
+# the bus only once it has been woken, rather than after every round of its tasks, as of
+# z-galaxy/zruntime#63, and epoll and kqueue report a socket as it turns ready, rather than on every
+# wait for as long as it stays ready, as of z-galaxy/zruntime#65. No release of zruntime has any of
+# these yet. Patching crates.io's zruntime, rather than depending on it from git, has zbus build on
 # it too: busd and zbus must share one runtime.
 [patch.crates-io.zruntime]
 git = "https://github.com/z-galaxy/zruntime"
-rev = "b3bd01d8fc1827c690d2525a157694afd030ea4b"
+rev = "aae96ac214183ed6636968a7432e2313b3ea977d"
 
 # The bus writes the messages that it forwards to a client in one go, with `Connection::send_all`
 # (z-galaxy/zbus#2079), and decodes the header of each message that it receives in one pass
