@@ -21,7 +21,7 @@ name = "busd"
 path = "src/bin/busd.rs"
 
 [dependencies]
-zbus = { version = "6.0.0", features = [
+zbus = { version = "6.2.0", features = [
     "default-rt",
     "bus-impl",
     "service",
@@ -41,7 +41,7 @@ anyhow = "1.0.82"
 serde = { version = "1.0.200", features = ["rc"] }
 futures-util = { version = "0.3.30", default-features = false, features = ["alloc"] }
 xdg-home = "1.1.0"
-zruntime = { version = "0.2.1", features = [
+zruntime = { version = "0.2.2", features = [
     "fs",
     "helper",
     "lock",
@@ -83,28 +83,3 @@ strip = "symbols"
 # No one needs an undebuggable release binary
 debug = "full"
 
-# The time limit on each send to a client reads the clock only once the send has to wait, as of
-# z-galaxy/zruntime#58, and the socket of a client that a wait found readable stays watched until
-# the task that the wait woke has run, rather than being let go of and watched again for each
-# message where many clients are busy, as of z-galaxy/zruntime#60. `block_on` polls the future of
-# the bus only once it has been woken, rather than after every round of its tasks, as of
-# z-galaxy/zruntime#63, and epoll and kqueue report a socket as it turns ready, rather than on every
-# wait for as long as it stays ready, as of z-galaxy/zruntime#65. No release of zruntime has any of
-# these yet. Patching crates.io's zruntime, rather than depending on it from git, has zbus build on
-# it too: busd and zbus must share one runtime.
-[patch.crates-io.zruntime]
-git = "https://github.com/z-galaxy/zruntime"
-rev = "aae96ac214183ed6636968a7432e2313b3ea977d"
-
-# The bus writes the messages that it forwards to a client in one go, with `Connection::send_all`
-# (z-galaxy/zbus#2079), and decodes the header of each message that it receives in one pass
-# (z-galaxy/zbus#2081), with a cheaper parse of the signature of its body (z-galaxy/zbus#2083), and
-# has zbus check the body of each message of its clients as it receives it, and sets the sender of
-# a message with `Message::with_sender` (z-galaxy/zbus#2086). The connection of each client reads as
-# much as its socket holds into a buffer that it keeps, and takes each message that is whole in it
-# out of it without reading again (z-galaxy/zbus#2090).
-# zbus's main branch has these, but no release of zbus yet. Patching crates.io's zbus, rather than
-# depending on it from git, has the tests, which depend on zbus too, build on it as well.
-[patch.crates-io.zbus]
-git = "https://github.com/z-galaxy/zbus"
-rev = "90a0bd1bc7ed90ffbba27e61333c61b79098c816"
