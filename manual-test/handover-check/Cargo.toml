@@ -1,0 +1,13 @@
+[package]
+name = "handover-check"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# A package of its own, rather than a member of busd's.
+[workspace]
+
+[dependencies]
+async-io = "2.6.0"
+futures-util = "0.3.34"
+zbus = "6.2.1"

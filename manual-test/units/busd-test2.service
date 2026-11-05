@@ -1,0 +1,10 @@
+[Unit]
+Description=A test bus of busd, with no socket activation
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/busd-test --session --address unix:path=%t/busd-test2
+# busd only logs errors by default; this shows the hand-over.
+Environment=RUST_LOG=busd=info
+FileDescriptorStoreMax=4096
+LimitNOFILE=8192:524288

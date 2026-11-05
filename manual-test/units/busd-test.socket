@@ -1,0 +1,5 @@
+[Unit]
+Description=Socket of a test bus of busd
+
+[Socket]
+ListenStream=%t/busd-test
