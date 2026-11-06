@@ -1,5 +1,7 @@
 extern crate busd;
 
+#[cfg(target_os = "linux")]
+use std::os::fd::OwnedFd;
 use std::{
     fs::File,
     io::Write,
@@ -10,6 +12,8 @@ use std::{
 
 use busd::{bus, config::Config, error, info, warn};
 
+#[cfg(target_os = "linux")]
+use anyhow::bail;
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures_util::future::{select, Either};
@@ -60,10 +64,18 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    zruntime::block_on(run())
+    // systemd passes file descriptors through environment variables, which busd removes as it
+    // takes them: that may only happen before any other thread starts.
+    #[cfg(target_os = "linux")]
+    let passed = busd::systemd::take_listen_fds()?;
+
+    zruntime::block_on(run(
+        #[cfg(target_os = "linux")]
+        passed,
+    ))
 }
 
-async fn run() -> Result<()> {
+async fn run(#[cfg(target_os = "linux")] passed: Vec<OwnedFd>) -> Result<()> {
     busd::tracing_subscriber::init();
 
     let args = Args::parse();
@@ -83,7 +95,18 @@ async fn run() -> Result<()> {
         [Signal::Interrupt, Signal::Terminate],
     )?;
 
-    let mut bus = bus::Bus::for_address(address.as_deref()).await?;
+    // Under systemd's socket activation, the bus listens on the socket that systemd passes.
+    #[cfg(target_os = "linux")]
+    let bus = match listener(passed)? {
+        Some(listener) => Some(bus::Bus::for_listener(listener).await?),
+        None => None,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let bus = None;
+    let mut bus = match bus {
+        Some(bus) => bus,
+        None => bus::Bus::for_address(address.as_deref()).await?,
+    };
 
     if let Some(fd) = args.ready_fd {
         // SAFETY: We don't have any way to know if the fd is valid or not. The parent process is
@@ -118,6 +141,19 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The socket that systemd's socket activation passed, out of the file descriptors that systemd
+/// passed, `fds`, if there is one.
+#[cfg(target_os = "linux")]
+fn listener(fds: Vec<OwnedFd>) -> Result<Option<OwnedFd>> {
+    let mut fds = fds.into_iter();
+    let listener = fds.next();
+    if fds.next().is_some() {
+        bail!("systemd passed more than one socket to listen on: busd listens on one.");
+    }
+
+    Ok(listener)
 }
 
 /// The configuration that `args` ask for.
