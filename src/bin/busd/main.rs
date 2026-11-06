@@ -1,6 +1,9 @@
 extern crate busd;
 
 #[cfg(target_os = "linux")]
+mod fdstore;
+
+#[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 use std::{
     fs::File,
@@ -12,8 +15,6 @@ use std::{
 
 use busd::{bus, config::Config, error, info, warn};
 
-#[cfg(target_os = "linux")]
-use anyhow::bail;
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures_util::future::{select, Either};
@@ -65,6 +66,9 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    // The next instance of busd, which it hands over to, starts with the same limit.
+    #[cfg(target_os = "linux")]
+    let fd_limit = getrlimit(Resource::Nofile).current;
     // Before the runtime, or anything else, opens file descriptors of its own.
     let raised = raise_fd_limit();
     // systemd passes file descriptors through environment variables, which busd removes as it
@@ -75,13 +79,16 @@ fn main() -> Result<()> {
     zruntime::block_on(run(
         raised,
         #[cfg(target_os = "linux")]
+        fd_limit,
+        #[cfg(target_os = "linux")]
         passed,
     ))
 }
 
 async fn run(
     raised: rustix::io::Result<()>,
-    #[cfg(target_os = "linux")] passed: Vec<OwnedFd>,
+    #[cfg(target_os = "linux")] fd_limit: Option<u64>,
+    #[cfg(target_os = "linux")] passed: Vec<(String, OwnedFd)>,
 ) -> Result<()> {
     busd::tracing_subscriber::init();
     if let Err(e) = raised {
@@ -105,18 +112,27 @@ async fn run(
         [Signal::Interrupt, Signal::Terminate],
     )?;
 
+    // Under systemd, the bus takes over from its previous instance, or listens on the socket of the
+    // socket activation, if systemd passes either.
     #[cfg(target_os = "linux")]
     let notifier = busd::systemd::Notifier::from_env().unwrap_or_else(|e| {
         warn!("Ignoring `$NOTIFY_SOCKET`: {e}");
 
         None
     });
-    // Under systemd's socket activation, the bus listens on the socket that systemd passes.
+    // Under systemd, the bus may hand over as it stops, which opens a few file descriptors, so it
+    // keeps them to spare from before it serves anyone.
     #[cfg(target_os = "linux")]
-    let bus = match listener(passed)? {
-        Some(listener) => Some(bus::Bus::for_listener(listener).await?),
+    let reserve = match notifier {
+        Some(_) => fdstore::Reserve::new()
+            .inspect_err(|e| warn!("Failed to reserve file descriptors to hand over with: {e}"))
+            .ok(),
         None => None,
     };
+    #[cfg(target_os = "linux")]
+    let bus = fdstore::Passed::new(passed)?
+        .bus(notifier.as_ref(), address.as_deref())
+        .await?;
     #[cfg(not(target_os = "linux"))]
     let bus = None;
     let mut bus = match bus {
@@ -160,6 +176,18 @@ async fn run(
         }
     }
 
+    // With a file descriptor store of systemd's to keep the clients in, the bus hands them over to
+    // its next instance rather than disconnect them. On a restart, systemd starts the next instance
+    // with them, and on a stop, it closes them.
+    #[cfg(target_os = "linux")]
+    if let Some(notifier) = &notifier {
+        if let Some(max) = fdstore::store_max() {
+            info!("Handing over to the next instance of the bus..");
+
+            return fdstore::hand_over(bus, notifier, max, fd_limit, reserve).await;
+        }
+    }
+
     if let Err(e) = bus.cleanup().await {
         error!("Failed to clean up: {}", e);
     }
@@ -196,19 +224,6 @@ fn raise_fd_limit() -> rustix::io::Result<()> {
     limit.current = maximum;
 
     setrlimit(Resource::Nofile, limit)
-}
-
-/// The socket that systemd's socket activation passed, out of the file descriptors that systemd
-/// passed, `fds`, if there is one.
-#[cfg(target_os = "linux")]
-fn listener(fds: Vec<OwnedFd>) -> Result<Option<OwnedFd>> {
-    let mut fds = fds.into_iter();
-    let listener = fds.next();
-    if fds.next().is_some() {
-        bail!("systemd passed more than one socket to listen on: busd listens on one.");
-    }
-
-    Ok(listener)
 }
 
 /// The configuration that `args` ask for.

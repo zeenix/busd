@@ -47,7 +47,7 @@ cargo clippy -- -D warnings
 
 ## Architecture
 
-The crate is both a library (`src/lib.rs`) and a thin CLI binary (`src/bin/busd.rs`,
+The crate is both a library (`src/lib.rs`) and a thin CLI binary (`src/bin/busd/main.rs`,
 argument parsing via clap). Key modules:
 
 - **`bus/`** — the broker core: accepts peer connections and routes messages between them.
