@@ -22,6 +22,11 @@ use zbus::{
 };
 use zruntime::{fs::remove_file, spawn, Shared, SharedRuntime};
 
+#[cfg(target_os = "linux")]
+pub(crate) mod handover;
+#[cfg(target_os = "linux")]
+pub use handover::{ClientHandover, Handover, STOP_TIMEOUT};
+
 use crate::{
     fdo::{self, DBus, Monitoring},
     peer::SEND_TIMEOUT,
